@@ -16,9 +16,10 @@ export const autoMigrateDatabase = () => {
       return false;
     }
 
-    // 1. CREATE USERS TABLE IF NOT EXISTS
+    // 1. RECREATE USERS TABLE CLEANLY TO AVOID COLUMN CONFLICTS
     db.exec(`
-      CREATE TABLE IF NOT EXISTS users (
+      DROP TABLE IF EXISTS users;
+      CREATE TABLE users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE NOT NULL,
         email TEXT UNIQUE,
@@ -27,18 +28,11 @@ export const autoMigrateDatabase = () => {
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    console.log('✅ Users table recreated successfully with correct schema');
 
     // Get credentials from Environment Variables or use defaults
     const rootUsername = process.env.ROOT_USERNAME || process.env.DEFAULT_ROOT_USERNAME || 'tsegawbizuayehuatredsea';
     const rootPassword = process.env.ROOT_PASSWORD || process.env.DEFAULT_ROOT_PASSWORD || '12345678';
-
-    // Delete existing root user first to force password reset with new credentials
-    try {
-      db.prepare("DELETE FROM users WHERE role = 'root' OR username = ?").run(rootUsername);
-      console.log(`🗑️ Cleared existing root account to overwrite...`);
-    } catch (e) {
-      console.log('ℹ️ No existing root user to delete');
-    }
 
     // Hash password & insert clean root user
     const hashedPassword = bcrypt.hashSync(rootPassword, 10);
@@ -48,7 +42,7 @@ export const autoMigrateDatabase = () => {
       VALUES (?, ?, ?, 'root')
     `).run(rootUsername, `${rootUsername}@redsea.com`, hashedPassword);
 
-    console.log(`✅ Default Root User set up successfully!`);
+    console.log(`✅ Default Root User created successfully!`);
     console.log(`   👉 Username: ${rootUsername}`);
 
     // 2. DATA REGISTRATIONS MIGRATION
