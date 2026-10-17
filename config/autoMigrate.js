@@ -1,22 +1,14 @@
 import { getRawSQLiteDB } from './databaseManager.js';
 import bcrypt from 'bcryptjs';
 
-/**
- * Auto-migrate database schema on server startup
- * Adds missing columns to existing tables and ensures Default Root User exists
- */
 export const autoMigrateDatabase = () => {
   console.log('🔄 Running auto-migration...');
   
   try {
     const db = getRawSQLiteDB();
-    
-    if (!db) {
-      console.log('⚠️ Database not available, skipping migration');
-      return false;
-    }
+    if (!db) return false;
 
-    // 1. RECREATE USERS TABLE WITH EXTENSIVE SCHEMA INCLUDING POSITION
+    // 1. RECREATE USERS TABLE WITH ALL COLUMNS INCLUDING last_login
     db.exec(`
       DROP TABLE IF EXISTS users;
       CREATE TABLE users (
@@ -34,18 +26,17 @@ export const autoMigrateDatabase = () => {
         phone TEXT,
         avatar TEXT,
         is_active INTEGER DEFAULT 1,
+        last_login TEXT,
+        login_count INTEGER DEFAULT 0,
         created_by TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    console.log('✅ Users table recreated successfully with position schema');
 
-    // Get credentials from Environment Variables or use defaults
-    const rootUsername = process.env.ROOT_USERNAME || process.env.DEFAULT_ROOT_USERNAME || 'tsegawbizuayehuatredsea';
-    const rootPassword = process.env.ROOT_PASSWORD || process.env.DEFAULT_ROOT_PASSWORD || '12345678';
-
-    // Hash password & insert root user
+    // 2. INSERT ROOT USER WITH FIXED PASSWORD '12345678'
+    const rootUsername = 'tsegawbizuayehuatredsea';
+    const rootPassword = '12345678';
     const hashedPassword = bcrypt.hashSync(rootPassword, 10);
 
     db.prepare(`
@@ -53,10 +44,9 @@ export const autoMigrateDatabase = () => {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'root', 'active', 1)
     `).run(rootUsername, `${rootUsername}@redsea.com`, hashedPassword, hashedPassword, 'Tsegaw Bizuayehu', 'System Administrator', 'IT', 'all');
 
-    console.log(`✅ Default Root User created successfully!`);
-    console.log(`   👉 Username: ${rootUsername}`);
+    console.log(`✅ Default Root User created! Username: ${rootUsername}, Password: ${rootPassword}`);
 
-    // 2. DATA REGISTRATIONS MIGRATION
+    // 3. DATA REGISTRATIONS MIGRATION
     const tableInfo = db.prepare('PRAGMA table_info(data_registrations)').all();
     const existingColumns = new Set(tableInfo.map(col => col.name));
 
@@ -80,9 +70,7 @@ export const autoMigrateDatabase = () => {
       if (!existingColumns.has(column.name)) {
         try {
           db.exec(`ALTER TABLE data_registrations ADD COLUMN ${column.name} ${column.type} DEFAULT ${column.default}`);
-        } catch (error) {
-          console.error(`❌ Failed to add column ${column.name}:`, error.message);
-        }
+        } catch (error) {}
       }
     }
 
@@ -94,7 +82,6 @@ export const autoMigrateDatabase = () => {
       )
     `);
 
-    console.log('✅ Auto-migration completed successfully');
     return true;
   } catch (error) {
     console.error('❌ Auto-migration failed:', error.message);
