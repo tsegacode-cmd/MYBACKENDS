@@ -1,4 +1,5 @@
 import { getRawSQLiteDB } from './databaseManager.js';
+import bcrypt from 'bcryptjs';
 
 export const autoMigrateDatabase = () => {
   console.log('🔄 Running auto-migration...');
@@ -7,7 +8,7 @@ export const autoMigrateDatabase = () => {
     const db = getRawSQLiteDB();
     if (!db) return false;
 
-    // 1. RECREATE USERS TABLE WITH ALL COLUMNS
+    // 1. RECREATE USERS TABLE WITH ALL REQUIRED COLUMNS
     db.exec(`
       DROP TABLE IF EXISTS users;
       CREATE TABLE users (
@@ -33,16 +34,17 @@ export const autoMigrateDatabase = () => {
       )
     `);
 
-    // 2. INSERT ROOT USER WITH PLAIN & HASHED PASSWORD '12345678'
+    // 2. INSERT ROOT USER WITH PROPER BCRYPT HASH FOR PASSWORD '12345678'
     const rootUsername = 'tsegawbizuayehuatredsea';
     const rootPassword = '12345678';
+    const hashedPassword = bcrypt.hashSync(rootPassword, 10);
 
     db.prepare(`
       INSERT INTO users (username, email, password, password_hash, full_name, position, department, permissions, role, status, is_active)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'root', 'active', 1)
-    `).run(rootUsername, `${rootUsername}@redsea.com`, rootPassword, rootPassword, 'Tsegaw Bizuayehu', 'System Administrator', 'IT', 'all');
+    `).run(rootUsername, `${rootUsername}@redsea.com`, hashedPassword, hashedPassword, 'Tsegaw Bizuayehu', 'System Administrator', 'IT', 'all');
 
-    console.log(`✅ Default Root User created successfully! Username: ${rootUsername}, Password: ${rootPassword}`);
+    console.log(`✅ Default Root User created successfully with proper bcrypt hash!`);
 
     // 3. DATA REGISTRATIONS MIGRATION
     const tableInfo = db.prepare('PRAGMA table_info(data_registrations)').all();
