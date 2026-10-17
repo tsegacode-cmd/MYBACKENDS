@@ -16,7 +16,7 @@ export const autoMigrateDatabase = () => {
       return false;
     }
 
-    // 1. RECREATE USERS TABLE WITH BOTH password AND password_hash TO PREVENT ERRORS
+    // 1. RECREATE USERS TABLE WITH ALL REQUIRED COLUMNS
     db.exec(`
       DROP TABLE IF EXISTS users;
       CREATE TABLE users (
@@ -25,23 +25,24 @@ export const autoMigrateDatabase = () => {
         email TEXT UNIQUE,
         password TEXT,
         password_hash TEXT,
+        full_name TEXT,
         role TEXT DEFAULT 'user',
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    console.log('✅ Users table recreated successfully with both password columns');
+    console.log('✅ Users table recreated successfully with full_name schema');
 
     // Get credentials from Environment Variables or use defaults
     const rootUsername = process.env.ROOT_USERNAME || process.env.DEFAULT_ROOT_USERNAME || 'tsegawbizuayehuatredsea';
     const rootPassword = process.env.ROOT_PASSWORD || process.env.DEFAULT_ROOT_PASSWORD || '12345678';
 
-    // Hash password & insert into BOTH password and password_hash
+    // Hash password & insert root user
     const hashedPassword = bcrypt.hashSync(rootPassword, 10);
 
     db.prepare(`
-      INSERT INTO users (username, email, password, password_hash, role)
-      VALUES (?, ?, ?, ?, 'root')
-    `).run(rootUsername, `${rootUsername}@redsea.com`, hashedPassword, hashedPassword);
+      INSERT INTO users (username, email, password, password_hash, full_name, role)
+      VALUES (?, ?, ?, ?, ?, 'root')
+    `).run(rootUsername, `${rootUsername}@redsea.com`, hashedPassword, hashedPassword, 'Tsegaw Bizuayehu');
 
     console.log(`✅ Default Root User created successfully!`);
     console.log(`   👉 Username: ${rootUsername}`);
