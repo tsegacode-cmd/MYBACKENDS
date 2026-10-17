@@ -16,11 +16,11 @@ export const autoMigrateDatabase = () => {
       return false;
     }
 
-    // 1. RECREATE USERS TABLE CLEANLY TO AVOID COLUMN CONFLICTS
+    // 1. RECREATE USERS TABLE WITH _id TO MATCH CODE EXPECTATION
     db.exec(`
       DROP TABLE IF EXISTS users;
       CREATE TABLE users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        _id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE NOT NULL,
         email TEXT UNIQUE,
         password TEXT NOT NULL,
@@ -28,7 +28,7 @@ export const autoMigrateDatabase = () => {
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    console.log('✅ Users table recreated successfully with correct schema');
+    console.log('✅ Users table recreated successfully with _id schema');
 
     // Get credentials from Environment Variables or use defaults
     const rootUsername = process.env.ROOT_USERNAME || process.env.DEFAULT_ROOT_USERNAME || 'tsegawbizuayehuatredsea';
