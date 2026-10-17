@@ -1,8 +1,9 @@
 import { getRawSQLiteDB } from './databaseManager.js';
+import bcrypt from 'bcryptjs';
 
 /**
  * Auto-migrate database schema on server startup
- * Adds missing columns to existing tables
+ * Adds missing columns to existing tables and ensures Default Root User exists
  */
 export const autoMigrateDatabase = () => {
   console.log('🔄 Running auto-migration...');
@@ -11,15 +12,48 @@ export const autoMigrateDatabase = () => {
     const db = getRawSQLiteDB();
     
     if (!db) {
-      console.log('⚠️  Database not available, skipping migration');
+      console.log('⚠️ Database not available, skipping migration');
       return false;
     }
 
-    // Get existing columns
+    // 1. ENSURE USERS TABLE EXISTS & ROOT USER CREATED
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        email TEXT UNIQUE,
+        password TEXT NOT NULL,
+        role TEXT DEFAULT 'user',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Get root user credentials from Environment Variables (or set fallback)
+    const rootUsername = process.env.ROOT_USERNAME || process.env.DEFAULT_ROOT_USERNAME || 'tsegawbizuayehuatredsea';
+    const rootPassword = process.env.ROOT_PASSWORD || process.env.DEFAULT_ROOT_PASSWORD || '12345678';
+
+    // Check if root user exists
+    const existingRoot = db.prepare('SELECT * FROM users WHERE username = ? OR role = ?').get(rootUsername, 'root');
+
+    if (!existingRoot) {
+      console.log(`🔑 Creating default root user (${rootUsername})...`);
+      const hashedPassword = bcrypt.hashSync(rootPassword, 10);
+      
+      db.prepare(`
+        INSERT INTO users (username, email, password, role)
+        VALUES (?, ?, ?, 'root')
+      `).run(rootUsername, `${rootUsername}@redsea.com`, hashedPassword);
+      
+      console.log('✅ Default root user created successfully!');
+    } else {
+      console.log(`ℹ️ Root user already exists: ${existingRoot.username}`);
+    }
+
+    // 2. DATA REGISTRATIONS COLUMNS MIGRATION
     const tableInfo = db.prepare('PRAGMA table_info(data_registrations)').all();
     const existingColumns = new Set(tableInfo.map(col => col.name));
     
-    console.log(`   Found ${existingColumns.size} existing columns`);
+    console.log(`   Found ${existingColumns.size} existing columns in data_registrations`);
 
     // Define new columns to add
     const newColumns = [
