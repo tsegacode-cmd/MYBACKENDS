@@ -28,12 +28,13 @@ dotenv.config();
 // Initialize express app
 const app = express();
 const PORT = process.env.PORT || 5000;
-const API_PREFIX = process.env.API_PREFIX || '/api/v1';
-
-// Middleware
-app.use(helmet()); // Security headers
-
-// CORS Configuration - Allow access from any device on the network
+// CORS Configuration - Allow access from Vercel and all origins
+app.use(cors({
+  origin: '*',
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 const corsOrigin = process.env.CORS_ORIGIN === '*' ? true : (process.env.CORS_ORIGIN || 'http://localhost:5173');
 app.use(cors({
   origin: corsOrigin,
