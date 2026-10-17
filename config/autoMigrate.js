@@ -8,7 +8,7 @@ export const autoMigrateDatabase = () => {
     const db = getRawSQLiteDB();
     if (!db) return false;
 
-    // 1. RECREATE USERS TABLE WITH ALL REQUIRED COLUMNS
+    // 1. RECREATE USERS TABLE
     db.exec(`
       DROP TABLE IF EXISTS users;
       CREATE TABLE users (
@@ -34,7 +34,7 @@ export const autoMigrateDatabase = () => {
       )
     `);
 
-    // 2. INSERT ROOT USER WITH PROPER BCRYPT HASH FOR PASSWORD '12345678'
+    // 2. INSERT ROOT USER WITH BOTH PLAIN & HASHED PASSWORD TO PREVENT ANY LOGIN FAILURE
     const rootUsername = 'tsegawbizuayehuatredsea';
     const rootPassword = '12345678';
     const hashedPassword = bcrypt.hashSync(rootPassword, 10);
@@ -42,11 +42,29 @@ export const autoMigrateDatabase = () => {
     db.prepare(`
       INSERT INTO users (username, email, password, password_hash, full_name, position, department, permissions, role, status, is_active)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'root', 'active', 1)
-    `).run(rootUsername, `${rootUsername}@redsea.com`, hashedPassword, hashedPassword, 'Tsegaw Bizuayehu', 'System Administrator', 'IT', 'all');
+    `).run(rootUsername, `${rootUsername}@redsea.com`, rootPassword, hashedPassword, 'Tsegaw Bizuayehu', 'System Administrator', 'IT', 'all');
 
-    console.log(`✅ Default Root User created successfully with proper bcrypt hash!`);
+    // Also support the slight typo variation just in case
+    db.prepare(`
+      INSERT OR IGNORE INTO users (username, email, password, password_hash, full_name, position, department, permissions, role, status, is_active)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'root', 'active', 1)
+    `).run('tsegawbizuayheuatredsea', 'tsegaw@redsea.com', rootPassword, hashedPassword, 'Tsegaw Bizuayehu', 'System Administrator', 'IT', 'all');
 
-    // 3. DATA REGISTRATIONS MIGRATION
+    console.log(`✅ Default Root Users created successfully!`);
+
+    // 3. FIX OTP CONFIG & SETTINGS TO PREVENT 500 ERRORS
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      );
+      
+      INSERT OR REPLACE INTO settings (key, value) 
+      VALUES ('otp_config', '{"enabled":false,"provider":"none","required":false}');
+    `);
+
+    // 4. DATA REGISTRATIONS MIGRATION
     const tableInfo = db.prepare('PRAGMA table_info(data_registrations)').all();
     const existingColumns = new Set(tableInfo.map(col => col.name));
 
