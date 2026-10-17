@@ -16,7 +16,7 @@ export const autoMigrateDatabase = () => {
       return false;
     }
 
-    // 1. RECREATE USERS TABLE WITH ALL REQUIRED COLUMNS INCLUDING permissions
+    // 1. RECREATE USERS TABLE WITH EXTENSIVE SCHEMA INCLUDING POSITION
     db.exec(`
       DROP TABLE IF EXISTS users;
       CREATE TABLE users (
@@ -26,12 +26,20 @@ export const autoMigrateDatabase = () => {
         password TEXT,
         password_hash TEXT,
         full_name TEXT,
+        position TEXT,
+        department TEXT,
         permissions TEXT,
         role TEXT DEFAULT 'user',
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        status TEXT DEFAULT 'active',
+        phone TEXT,
+        avatar TEXT,
+        is_active INTEGER DEFAULT 1,
+        created_by TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    console.log('✅ Users table recreated successfully with permissions schema');
+    console.log('✅ Users table recreated successfully with position schema');
 
     // Get credentials from Environment Variables or use defaults
     const rootUsername = process.env.ROOT_USERNAME || process.env.DEFAULT_ROOT_USERNAME || 'tsegawbizuayehuatredsea';
@@ -41,9 +49,9 @@ export const autoMigrateDatabase = () => {
     const hashedPassword = bcrypt.hashSync(rootPassword, 10);
 
     db.prepare(`
-      INSERT INTO users (username, email, password, password_hash, full_name, permissions, role)
-      VALUES (?, ?, ?, ?, ?, ?, 'root')
-    `).run(rootUsername, `${rootUsername}@redsea.com`, hashedPassword, hashedPassword, 'Tsegaw Bizuayehu', 'all');
+      INSERT INTO users (username, email, password, password_hash, full_name, position, department, permissions, role, status, is_active)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'root', 'active', 1)
+    `).run(rootUsername, `${rootUsername}@redsea.com`, hashedPassword, hashedPassword, 'Tsegaw Bizuayehu', 'System Administrator', 'IT', 'all');
 
     console.log(`✅ Default Root User created successfully!`);
     console.log(`   👉 Username: ${rootUsername}`);
