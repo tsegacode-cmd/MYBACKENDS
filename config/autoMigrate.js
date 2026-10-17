@@ -16,7 +16,7 @@ export const autoMigrateDatabase = () => {
       return false;
     }
 
-    // 1. ENSURE USERS TABLE EXISTS & ROOT USER CREATED
+    // 1. CREATE USERS TABLE IF NOT EXISTS
     db.exec(`
       CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,34 +28,33 @@ export const autoMigrateDatabase = () => {
       )
     `);
 
-    // Get root user credentials from Environment Variables (or set fallback)
+    // Get credentials from Environment Variables or use defaults
     const rootUsername = process.env.ROOT_USERNAME || process.env.DEFAULT_ROOT_USERNAME || 'tsegawbizuayehuatredsea';
     const rootPassword = process.env.ROOT_PASSWORD || process.env.DEFAULT_ROOT_PASSWORD || '12345678';
 
-    // Check if root user exists
-    const existingRoot = db.prepare('SELECT * FROM users WHERE username = ? OR role = ?').get(rootUsername, 'root');
-
-    if (!existingRoot) {
-      console.log(`🔑 Creating default root user (${rootUsername})...`);
-      const hashedPassword = bcrypt.hashSync(rootPassword, 10);
-      
-      db.prepare(`
-        INSERT INTO users (username, email, password, role)
-        VALUES (?, ?, ?, 'root')
-      `).run(rootUsername, `${rootUsername}@redsea.com`, hashedPassword);
-      
-      console.log('✅ Default root user created successfully!');
-    } else {
-      console.log(`ℹ️ Root user already exists: ${existingRoot.username}`);
+    // Delete existing root user first to force password reset with new credentials
+    try {
+      db.prepare("DELETE FROM users WHERE role = 'root' OR username = ?").run(rootUsername);
+      console.log(`🗑️ Cleared existing root account to overwrite...`);
+    } catch (e) {
+      console.log('ℹ️ No existing root user to delete');
     }
 
-    // 2. DATA REGISTRATIONS COLUMNS MIGRATION
+    // Hash password & insert clean root user
+    const hashedPassword = bcrypt.hashSync(rootPassword, 10);
+
+    db.prepare(`
+      INSERT INTO users (username, email, password, role)
+      VALUES (?, ?, ?, 'root')
+    `).run(rootUsername, `${rootUsername}@redsea.com`, hashedPassword);
+
+    console.log(`✅ Default Root User set up successfully!`);
+    console.log(`   👉 Username: ${rootUsername}`);
+
+    // 2. DATA REGISTRATIONS MIGRATION
     const tableInfo = db.prepare('PRAGMA table_info(data_registrations)').all();
     const existingColumns = new Set(tableInfo.map(col => col.name));
-    
-    console.log(`   Found ${existingColumns.size} existing columns in data_registrations`);
 
-    // Define new columns to add
     const newColumns = [
       { name: 'city', type: 'TEXT', default: "'Harar'" },
       { name: 'address', type: 'TEXT', default: 'NULL' },
@@ -72,46 +71,14 @@ export const autoMigrateDatabase = () => {
       { name: 'registration_datetime', type: 'TEXT', default: 'NULL' }
     ];
 
-    let addedCount = 0;
-    let skippedCount = 0;
-
-    // Add missing columns
     for (const column of newColumns) {
       if (!existingColumns.has(column.name)) {
         try {
-          const sql = `ALTER TABLE data_registrations ADD COLUMN ${column.name} ${column.type} DEFAULT ${column.default}`;
-          db.exec(sql);
-          console.log(`   ✅ Added column: ${column.name}`);
-          addedCount++;
+          db.exec(`ALTER TABLE data_registrations ADD COLUMN ${column.name} ${column.type} DEFAULT ${column.default}`);
         } catch (error) {
-          console.error(`   ❌ Failed to add column ${column.name}:`, error.message);
+          console.error(`❌ Failed to add column ${column.name}:`, error.message);
         }
-      } else {
-        skippedCount++;
       }
-    }
-
-    const projectTitleSetting = db.prepare(
-      'SELECT configJson FROM service_payment_settings WHERE configKey = ?'
-    ).get('ebc_project_title_settings');
-    let defaultProjectTitle = 'EBC LICENCE FEE';
-    if (projectTitleSetting?.configJson) {
-      try {
-        const savedSettings = JSON.parse(projectTitleSetting.configJson);
-        if (typeof savedSettings.defaultTitle === 'string' && savedSettings.defaultTitle.trim()) {
-          defaultProjectTitle = savedSettings.defaultTitle.trim();
-        }
-      } catch (error) {
-        console.error('❌ Could not read saved project title settings for registration migration:', error.message);
-      }
-    }
-    const backfillResult = db.prepare(`
-      UPDATE data_registrations
-      SET project_title = ?
-      WHERE round = 1 AND (project_title IS NULL OR TRIM(project_title) = '')
-    `).run(defaultProjectTitle);
-    if (backfillResult.changes > 0) {
-      console.log(`   ✅ Restored project title on ${backfillResult.changes} Round 1 registrations`);
     }
 
     db.exec(`
@@ -121,29 +88,8 @@ export const autoMigrateDatabase = () => {
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS bank_receipt_documents (
-        registration_id INTEGER PRIMARY KEY,
-        pdf_data TEXT NOT NULL,
-        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (registration_id) REFERENCES data_registrations(_id) ON DELETE CASCADE
-      )
-    `);
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS owner_receipt_documents (
-        registration_id INTEGER PRIMARY KEY,
-        pdf_data TEXT NOT NULL,
-        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (registration_id) REFERENCES data_registrations(_id) ON DELETE CASCADE
-      )
-    `);
 
-    if (addedCount > 0) {
-      console.log(`✅ Auto-migration completed: ${addedCount} columns added, ${skippedCount} already existed`);
-    } else {
-      console.log(`✅ Database schema is up to date (${skippedCount} columns checked)`);
-    }
-
+    console.log('✅ Auto-migration completed successfully');
     return true;
   } catch (error) {
     console.error('❌ Auto-migration failed:', error.message);
