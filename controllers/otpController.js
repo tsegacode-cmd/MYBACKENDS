@@ -211,15 +211,22 @@ const getConfig = () => {
   const row = db.prepare('SELECT encrypted_config FROM otp_settings WHERE id = 1').get();
   if (!row) return {};
 
-  const { config, needsReEncryption } = decryptConfig(row.encrypted_config);
-  if (needsReEncryption) {
-    db.prepare(`
-      UPDATE otp_settings
-      SET encrypted_config = ?, updated_at = datetime('now')
-      WHERE id = 1
-    `).run(encryptConfig(config));
+  try {
+    const { config, needsReEncryption } = decryptConfig(row.encrypted_config);
+    if (needsReEncryption) {
+      db.prepare(`
+        UPDATE otp_settings
+        SET encrypted_config = ?, updated_at = datetime('now')
+        WHERE id = 1
+      `).run(encryptConfig(config));
+    }
+    return config;
+  } catch (error) {
+    // 🛠️ ቁልፉ የማይዛመድ ከሆነ ወይም de-crypt ማድረግ ካልቻለ አሮጌውን አጥፍቶ ባዶ መቼት በመፍጠር ሰርቨሩ እንዳይቋረጥ ያደርጋል
+    console.error('Resetting incompatible OTP settings due to secret change:', error.message);
+    db.prepare('DELETE FROM otp_settings WHERE id = 1').run();
+    return {};
   }
-  return config;
 };
 
 const safeConfig = (config) => ({
