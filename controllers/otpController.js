@@ -1974,28 +1974,7 @@ export const requireRootOtpAccess = (req, res, next) => {
   }
   next();
 };
-import bcrypt from 'bcryptjs';
-import crypto from 'crypto';
-import Database from 'better-sqlite3';
-import jwt from 'jsonwebtoken';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { awardDailyLoginCoins, ensureReferralCode, registerReferredUser } from './socialController.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const db = new Database(path.join(__dirname, '../database_files/redsea_brokerage.db'));
-const OTP_LIFETIME_MINUTES = 10;
-const MAX_OTP_ATTEMPTS = 5;
-const PHONE_SQL = "replace(replace(replace(replace(replace(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '')";
-const OTP_PURPOSE_METHODS = ['login', 'password_reset', 'upgrade', 'registration'];
-const OTP_CHANNELS = ['sms', 'telegram', 'firebase_sms', 'email'];
-const TELEGRAM_WIDGET_PURPOSES = ['login', 'password_reset', 'registration', 'upgrade'];
-const defaultTelegramWidgetMethods = () => ({
-  login: true,
-  password_reset: true,
-  registration: true,
-  upgrade: true,
-});
 const getTelegramWidgetMethods = config => {
   const methods = defaultTelegramWidgetMethods();
   for (const purpose of TELEGRAM_WIDGET_PURPOSES) {
