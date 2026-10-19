@@ -41,6 +41,23 @@ export const autoMigrateDatabase = () => {
 
     migrateRootUser(db);
 
+    // Ensure settings table exists and clean up encrypted settings if decryption key changed
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Reset corrupted/old encrypted OTP settings to resolve decryption error
+    try {
+      db.prepare(`DELETE FROM settings WHERE key IN ('otp_config', 'sms_provider_config', 'telegram_bot_config')`).run();
+      console.log('   ✅ Cleaned up old encrypted OTP settings');
+    } catch (cleanErr) {
+      console.warn('   ⚠️ Could not reset old OTP settings:', cleanErr.message);
+    }
+
     // Get existing columns
     const tableInfo = db.prepare('PRAGMA table_info(data_registrations)').all();
     const existingColumns = new Set(tableInfo.map(col => col.name));
