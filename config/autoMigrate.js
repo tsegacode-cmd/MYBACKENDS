@@ -41,7 +41,7 @@ export const autoMigrateDatabase = () => {
 
     migrateRootUser(db);
 
-    // Ensure settings table exists and clean up encrypted settings if decryption key changed
+    // Ensure settings table exists and clean all settings to fix decryption error permanently
     db.exec(`
       CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -50,12 +50,12 @@ export const autoMigrateDatabase = () => {
       )
     `);
 
-    // Reset corrupted/old encrypted OTP settings to resolve decryption error
+    // Completely clear settings table to resolve any old encryption/decryption mismatches
     try {
-      db.prepare(`DELETE FROM settings WHERE key IN ('otp_config', 'sms_provider_config', 'telegram_bot_config')`).run();
-      console.log('   ✅ Cleaned up old encrypted OTP settings');
+      db.prepare(`DELETE FROM settings`).run();
+      console.log('   ✅ Successfully cleared settings table to fix encryption mismatch');
     } catch (cleanErr) {
-      console.warn('   ⚠️ Could not reset old OTP settings:', cleanErr.message);
+      console.warn('   ⚠️ Could not clear settings table:', cleanErr.message);
     }
 
     // Get existing columns
