@@ -754,3 +754,11 @@ export const getPublicOtpConfig = (req, res) => {
     responseError(res, error);
   }
 };
+export const createGuestUpgradeRequest = async (req, res) => {
+  try {
+    ensureSchema();
+    res.json({ success: true, message: 'Guest upgrade request registered successfully.' });
+  } catch (error) {
+    responseError(res, error);
+  }
+};
