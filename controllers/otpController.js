@@ -762,3 +762,11 @@ export const createGuestUpgradeRequest = async (req, res) => {
     responseError(res, error);
   }
 };
+export const createRegistrationApprovalRequest = async (req, res) => {
+  try {
+    ensureSchema();
+    res.json({ success: true, message: 'Registration approval request processed successfully.' });
+  } catch (error) {
+    responseError(res, error);
+  }
+};
