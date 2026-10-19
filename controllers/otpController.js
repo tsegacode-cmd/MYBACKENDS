@@ -369,8 +369,51 @@ export const verifyTelegramLink = (req, res) => {
 export const telegramMiniAppLogin = (req, res) => {
   try {
     ensureSchema();
-    res.json({ success: true, message: 'Telegram Mini App login successful.' });
+    getSecret();
+
+    const initData = String(req.body.initData || '');
+    if (!initData) {
+      return res.status(400).json({ success: false, message: 'Telegram Mini App data is missing.' });
+    }
+
+    const params = new URLSearchParams(initData);
+    let telegramUser;
+    try {
+      telegramUser = JSON.parse(params.get('user') || '{}');
+    } catch {
+      return res.status(401).json({ success: false, message: 'Telegram Mini App user data is invalid.' });
+    }
+
+    if (!telegramUser?.id) {
+      return res.status(401).json({ success: false, message: 'Telegram Mini App returned an invalid session.' });
+    }
+
+    const user = db.prepare(`
+      SELECT _id AS id, username, email, full_name, role, permissions, position, phone,
+             telegram_chat_id, is_active
+      FROM users WHERE telegram_chat_id = ? AND is_active = 1
+    `).get(String(telegramUser.id));
+
+    if (!user) {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'No active account is linked to this Telegram account. Link Telegram in My Profile first.' 
+      });
+    }
+
+    db.prepare("UPDATE users SET last_login = datetime('now') WHERE _id = ?").run(user.id);
+    
+    const token = jwt.sign({
+      id: user.id,
+      email: user.email,
+      username: user.username,
+      role: user.role,
+    }, getSecret(), { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
+
+    delete user.password_hash;
+    res.json({ success: true, message: 'Telegram Mini App login successful.', data: { token, user } });
   } catch (error) {
+    console.error('Telegram Mini App login failed:', error.message);
     responseError(res, error);
   }
 };
@@ -378,8 +421,39 @@ export const telegramMiniAppLogin = (req, res) => {
 export const telegramWidgetLogin = (req, res) => {
   try {
     ensureSchema();
-    res.json({ success: true, message: 'Telegram sign-in successful.' });
+    getSecret();
+
+    const telegramUser = req.body.telegramUser;
+    if (!telegramUser || typeof telegramUser !== 'object' || !telegramUser.id) {
+      return res.status(400).json({ success: false, message: 'Telegram sign-in returned an invalid session.' });
+    }
+
+    const user = db.prepare(`
+      SELECT _id AS id, username, email, full_name, role, permissions, position, phone,
+             telegram_chat_id, is_active
+      FROM users WHERE telegram_chat_id = ? AND is_active = 1
+    `).get(String(telegramUser.id));
+
+    if (!user) {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'No active account is linked to this Telegram account. Link Telegram in My Profile first.' 
+      });
+    }
+
+    db.prepare("UPDATE users SET last_login = datetime('now') WHERE _id = ?").run(user.id);
+    
+    const token = jwt.sign({
+      id: user.id,
+      email: user.email,
+      username: user.username,
+      role: user.role,
+    }, getSecret(), { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
+
+    delete user.password_hash;
+    res.json({ success: true, message: 'Telegram sign-in successful.', data: { token, user } });
   } catch (error) {
+    console.error('Telegram Login Widget sign-in failed:', error.message);
     responseError(res, error);
   }
 };
