@@ -456,3 +456,11 @@ export const saveOtpSettings = async (req, res) => {
     responseError(res, error);
   }
 };
+export const getRegistrationApprovalStatus = async (req, res) => {
+  try {
+    ensureSchema();
+    res.json({ success: true, data: { status: 'none' } });
+  } catch (error) {
+    responseError(res, error);
+  }
+};
