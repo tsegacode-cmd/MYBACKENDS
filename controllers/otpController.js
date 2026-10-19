@@ -25,7 +25,7 @@ const defaultTelegramWidgetMethods = () => ({
 const getTelegramWidgetMethods = config => {
   const methods = defaultTelegramWidgetMethods();
   for (const purpose of TELEGRAM_WIDGET_PURPOSES) {
-    const saved = config.telegramWidgetMethods?.[purpose];
+    const saved = config?.telegramWidgetMethods?.[purpose];
     if (typeof saved === 'boolean') methods[purpose] = saved;
   }
   return methods;
@@ -42,7 +42,7 @@ const getPurposeMethods = config => {
   const methods = defaultPurposeMethods();
   for (const purpose of OTP_PURPOSE_METHODS) {
     for (const channel of OTP_CHANNELS) {
-      const saved = config.purposeMethods?.[purpose]?.[channel];
+      const saved = config?.purposeMethods?.[purpose]?.[channel];
       if (typeof saved === 'boolean') {
         methods[purpose][channel] = saved;
       }
@@ -175,7 +175,7 @@ const getConfig = () => {
   return config;
 };
 
-const safeConfig = (config) => ({
+const safeConfig = (config = {}) => ({
   smsProvider: config.smsProvider || 'custom',
   smsEndpoint: config.smsEndpoint || '',
   smsAuthHeader: config.smsAuthHeader || 'Authorization',
@@ -187,7 +187,9 @@ const safeConfig = (config) => ({
   telegramConfigured: Boolean(config.telegramBotToken),
   rootTelegramChatId: config.rootTelegramChatId || '',
   rootTelegramChatConfigured: Boolean(config.rootTelegramChatId),
-  smsConfigured: Boolean(config.smsApiToken && config.smsEndpoint),
+  smsConfigured: config.smsProvider === 'twilio'
+    ? Boolean(config.smsAccountSid && config.smsApiToken && (config.smsSenderId || config.smsMessagingServiceSid))
+    : Boolean(config.smsApiToken && config.smsEndpoint),
   telegramBotUsername: config.telegramBotUsername || '',
   supportTelegramUsername: config.supportTelegramUsername || '',
   telegramLoginWidgetConfigured: Boolean(config.telegramBotToken && config.telegramBotUsername),
@@ -208,7 +210,7 @@ const responseError = (res, error) => res.status(error.status || 500).json({
 });
 
 // ==========================================
-// ALL EXPORTED CONTROLLER FUNCTIONS REQUIRED BY AUTHROUTES.JS
+// ALL EXPORTED CONTROLLER FUNCTIONS REQUIRED BY ROUTES
 // ==========================================
 
 export const getOtpSettings = (req, res) => {
@@ -256,7 +258,11 @@ export const saveOtpSettings = async (req, res) => {
         updated_at = datetime('now')
     `).run(encryptConfig(newConfig));
 
-    res.json({ success: true, message: 'OTP settings saved successfully.' });
+    res.json({ 
+      success: true, 
+      message: 'OTP settings saved successfully.',
+      data: safeConfig(newConfig)
+    });
   } catch (error) {
     responseError(res, error);
   }
@@ -377,6 +383,7 @@ export const telegramWidgetLogin = (req, res) => {
     responseError(res, error);
   }
 };
+
 export const verifyGuestUpgradeOtp = async (req, res) => {
   try {
     ensureSchema();
@@ -394,6 +401,7 @@ export const verifyRegistrationApprovalOtp = async (req, res) => {
     responseError(res, error);
   }
 };
+
 export const approveRootGuestUpgrade = async (req, res) => {
   try {
     ensureSchema();
@@ -402,6 +410,7 @@ export const approveRootGuestUpgrade = async (req, res) => {
     responseError(res, error);
   }
 };
+
 export const getRootGuestUpgradeRequests = async (req, res) => {
   try {
     ensureSchema();
@@ -419,6 +428,7 @@ export const rejectRootGuestUpgrade = async (req, res) => {
     responseError(res, error);
   }
 };
+
 export const requireRootOtpAccess = (req, res, next) => {
   try {
     ensureSchema();
