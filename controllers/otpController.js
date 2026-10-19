@@ -419,3 +419,11 @@ export const rejectRootGuestUpgrade = async (req, res) => {
     responseError(res, error);
   }
 };
+export const requireRootOtpAccess = (req, res, next) => {
+  try {
+    ensureSchema();
+    next();
+  } catch (error) {
+    responseError(res, error);
+  }
+};
