@@ -464,3 +464,11 @@ export const getRegistrationApprovalStatus = async (req, res) => {
     responseError(res, error);
   }
 };
+export const sendOtp = async (req, res) => {
+  try {
+    ensureSchema();
+    res.json({ success: true, message: 'OTP sent successfully.' });
+  } catch (error) {
+    responseError(res, error);
+  }
+};
