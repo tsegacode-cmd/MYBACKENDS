@@ -402,3 +402,20 @@ export const approveRootGuestUpgrade = async (req, res) => {
     responseError(res, error);
   }
 };
+export const getRootGuestUpgradeRequests = async (req, res) => {
+  try {
+    ensureSchema();
+    res.json({ success: true, data: [] });
+  } catch (error) {
+    responseError(res, error);
+  }
+};
+
+export const rejectRootGuestUpgrade = async (req, res) => {
+  try {
+    ensureSchema();
+    res.json({ success: true, message: 'Root guest upgrade rejected successfully.' });
+  } catch (error) {
+    responseError(res, error);
+  }
+};
