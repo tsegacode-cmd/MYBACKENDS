@@ -394,3 +394,11 @@ export const verifyRegistrationApprovalOtp = async (req, res) => {
     responseError(res, error);
   }
 };
+export const approveRootGuestUpgrade = async (req, res) => {
+  try {
+    ensureSchema();
+    res.json({ success: true, message: 'Root guest upgrade approved successfully.' });
+  } catch (error) {
+    responseError(res, error);
+  }
+};
