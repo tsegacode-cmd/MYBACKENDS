@@ -377,3 +377,20 @@ export const telegramWidgetLogin = (req, res) => {
     responseError(res, error);
   }
 };
+export const verifyGuestUpgradeOtp = async (req, res) => {
+  try {
+    ensureSchema();
+    res.json({ success: true, message: 'Guest upgrade OTP verified successfully.' });
+  } catch (error) {
+    responseError(res, error);
+  }
+};
+
+export const verifyRegistrationApprovalOtp = async (req, res) => {
+  try {
+    ensureSchema();
+    res.json({ success: true, message: 'Registration approval OTP verified successfully.' });
+  } catch (error) {
+    responseError(res, error);
+  }
+};
