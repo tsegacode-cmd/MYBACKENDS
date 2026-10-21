@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 
 /**
  * Auto-migrate database schema on server startup
- * Creates tables first, then synchronizes root user and adds columns/indexes
+ * Creates tables (including commission_settings) first, then synchronizes root user and adds columns/indexes
  */
 export const autoMigrateDatabase = async () => {
   console.log('🔄 Running auto-migration (PostgreSQL)...');
@@ -16,7 +16,7 @@ export const autoMigrateDatabase = async () => {
       return false;
     }
 
-    // 1. CREATE TABLES FIRST (Mandatory before inserting or altering)
+    // 1. CREATE TABLES FIRST (Including commission_settings in users table)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -25,11 +25,17 @@ export const autoMigrateDatabase = async () => {
         full_name VARCHAR(255),
         role VARCHAR(50) DEFAULT 'user',
         position VARCHAR(100),
+        commission_settings TEXT,
         is_active INTEGER DEFAULT 1,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+
+    // Ensure commission_settings exists if users table was already created previously without it
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS commission_settings TEXT;
+    `).catch(() => {});
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS data_registrations (
