@@ -1,25 +1,17 @@
 import bcrypt from 'bcryptjs';
-import { getRawSQLiteDB } from '../config/sqliteDatabase.js';
+import { getPostgreSQLPool } from '../config/databaseManager.js';
 
-const getDB = () => getRawSQLiteDB();
-
-// Helper to execute SQLite queries
-const query = (sql, params = []) => {
+// Helper to execute PostgreSQL queries
+const query = async (sql, params = []) => {
+  const pool = getPostgreSQLPool();
+  if (!pool) {
+    throw new Error('PostgreSQL database pool not available');
+  }
   try {
-    const database = getDB();
-    
-    // Check if it's a SELECT query
-    if (sql.trim().toUpperCase().startsWith('SELECT')) {
-      const stmt = database.prepare(sql);
-      return stmt.all(...params);
-    }
-    
-    // For INSERT, UPDATE, DELETE
-    const stmt = database.prepare(sql);
-    const result = stmt.run(...params);
+    const result = await pool.query(sql, params);
     return result;
   } catch (error) {
-    console.error('❌ SQLite Query Error:', error.message);
+    console.error('❌ PostgreSQL Query Error:', error.message);
     console.error('   SQL:', sql);
     console.error('   Params:', params);
     throw error;
@@ -27,11 +19,14 @@ const query = (sql, params = []) => {
 };
 
 const normalizePhoneNumber = phone => String(phone || '').replace(/\D/g, '');
-const hasDuplicatePhoneNumber = (phone, excludedUserId = null) => {
+
+const hasDuplicatePhoneNumber = async (pool, phone, excludedUserId = null) => {
   const phoneDigits = normalizePhoneNumber(phone);
   if (!phoneDigits) return false;
-  return query('SELECT _id, phone FROM users WHERE phone IS NOT NULL').some(user =>
-    String(user._id) !== String(excludedUserId) &&
+  
+  const res = await pool.query('SELECT id, phone FROM users WHERE phone IS NOT NULL');
+  return res.rows.some(user =>
+    String(user.id) !== String(excludedUserId) &&
     normalizePhoneNumber(user.phone) === phoneDigits
   );
 };
@@ -39,8 +34,8 @@ const hasDuplicatePhoneNumber = (phone, excludedUserId = null) => {
 // Helper to check if database is available
 const isDatabaseAvailable = () => {
   try {
-    const database = getDB();
-    return database !== null;
+    const pool = getPostgreSQLPool();
+    return pool !== null;
   } catch (error) {
     console.error('❌ Database availability check failed:', error.message);
     return false;
@@ -50,9 +45,8 @@ const isDatabaseAvailable = () => {
 // Create new user
 export const createUser = async (req, res, next) => {
   try {
-    const { username, email, password, full_name, role, position, phone, permissions } = req.body;
+    const { username, email, password, full_name, role, position, phone, permissions, commission_settings } = req.body;
 
-    // Validate required fields
     if (!username || !password) {
       return res.status(400).json({
         success: false,
@@ -60,87 +54,85 @@ export const createUser = async (req, res, next) => {
       });
     }
 
-    const dbAvailable = isDatabaseAvailable();
-
-    if (dbAvailable) {
-      console.log('✅ Using SQLite database for user storage');
-      
-      // Check if username already exists
-      const existingUsers = query('SELECT _id FROM users WHERE username = ?', [username]);
-      if (existingUsers.length > 0) {
-        return res.status(400).json({
-          success: false,
-          message: 'Username already exists'
-        });
-      }
-
-      // Hash password
-      const hashedPassword = await bcrypt.hash(password, 10);
-
-      // Prepare permissions JSON
-      const permissionsJson = permissions ? JSON.stringify(permissions) : null;
-
-      // Insert user
-      const creatorId = req.user?.id == null ? null : String(req.user.id);
-      const creatorRole = req.user?.role == null ? null : String(req.user.role);
-      const sql = `
-        INSERT INTO users (
-          username, email, password_hash, full_name, role, permissions, position, phone,
-          is_active, created_at, created_by_user_id, created_by_role
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), ?, ?)
-      `;
-      
-      const result = getDB().transaction(() => {
-        if (hasDuplicatePhoneNumber(phone)) return null;
-        return query(sql, [
-          username,
-          email || null,
-          hashedPassword,
-          full_name || null,
-          role || 'user',
-          permissionsJson,
-          position || null,
-          phone || null,
-          creatorId,
-          creatorRole
-        ]);
-      })();
-      if (!result) {
-        return res.status(400).json({
-          success: false,
-          message: 'Phone number already exists'
-        });
-      }
-
-      console.log(`✅ User saved to SQLite database: ${username} (ID: ${result.lastInsertRowid})`);
-
-      res.status(201).json({
-        success: true,
-        message: 'User created successfully',
-        data: {
-          id: result.lastInsertRowid,
-          _id: result.lastInsertRowid,
-          username,
-          email: email || null,
-          full_name: full_name || null,
-          role: role || 'user',
-          permissions: permissions || null,
-          position: position || null,
-          phone: phone || null,
-          is_active: true,
-          created_at: new Date().toISOString(),
-          created_by_user_id: creatorId,
-          created_by_role: creatorRole,
-          created_by_username: req.user?.username || null
-        }
-      });
-    } else {
+    if (!isDatabaseAvailable()) {
       return res.status(503).json({
         success: false,
         message: 'Database not available'
       });
     }
+
+    const pool = getPostgreSQLPool();
+
+    // Check if username already exists
+    const existingCheck = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+    if (existingCheck.rows.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Username already exists'
+      });
+    }
+
+    // Check duplicate phone number
+    if (await hasDuplicatePhoneNumber(pool, phone)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Phone number already exists'
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const permissionsJson = permissions ? JSON.stringify(permissions) : null;
+    const commissionSettingsJson = commission_settings ? (typeof commission_settings === 'string' ? commission_settings : JSON.stringify(commission_settings)) : null;
+    const creatorId = req.user?.id == null ? null : String(req.user.id);
+    const creatorRole = req.user?.role == null ? null : String(req.user.role);
+
+    const sql = `
+      INSERT INTO users (
+        username, email, password_hash, full_name, role, permissions, commission_settings, position, phone,
+        is_active, created_at, created_by_user_id, created_by_role
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, CURRENT_TIMESTAMP, $10, $11)
+      RETURNING id, created_at;
+    `;
+
+    const result = await pool.query(sql, [
+      username,
+      email || null,
+      hashedPassword,
+      full_name || null,
+      role || 'user',
+      permissionsJson,
+      commissionSettingsJson,
+      position || null,
+      phone || null,
+      creatorId,
+      creatorRole
+    ]);
+
+    const newUserId = result.rows[0].id;
+    console.log(`✅ User saved to PostgreSQL database with commission settings: ${username} (ID: ${newUserId})`);
+
+    res.status(201).json({
+      success: true,
+      message: 'User created successfully',
+      data: {
+        id: newUserId,
+        _id: newUserId,
+        username,
+        email: email || null,
+        full_name: full_name || null,
+        role: role || 'user',
+        permissions: permissions || null,
+        commission_settings: commission_settings || null,
+        position: position || null,
+        phone: phone || null,
+        is_active: true,
+        created_at: result.rows[0].created_at,
+        created_by_user_id: creatorId,
+        created_by_role: creatorRole,
+        created_by_username: req.user?.username || null
+      }
+    });
   } catch (error) {
     console.error('❌ Create user error:', error);
     next(error);
@@ -150,40 +142,64 @@ export const createUser = async (req, res, next) => {
 // Get all users
 export const getAllUsers = async (req, res, next) => {
   try {
-    const dbAvailable = isDatabaseAvailable();
-
-    if (dbAvailable) {
-      console.log('✅ Loading users from SQLite database');
-      const isAgentAccount = String(req.user?.role || '').toLowerCase() === 'agent';
-      const sql = `
-        SELECT u._id as id, u.username, u.email, u.full_name, u.role, u.permissions,
-          u.commission_settings, u.position, u.phone, u.is_active, u.last_login, u.created_at,
-          u.created_by_user_id, u.created_by_role, creator.username AS created_by_username,
-          EXISTS(
-            SELECT 1 FROM social_presence presence
-            WHERE presence.user_id = CAST(u._id AS TEXT)
-              AND presence.last_seen >= datetime('now', '-90 seconds')
-          ) AS is_online
-        FROM users u
-        LEFT JOIN users creator ON CAST(creator._id AS TEXT) = u.created_by_user_id
-        ${isAgentAccount ? 'WHERE u.created_by_user_id = ? OR CAST(u._id AS TEXT) = ?' : ''}
-        ORDER BY u.created_at DESC
-      `;
-      const users = query(sql, isAgentAccount ? [String(req.user.id), String(req.user.id)] : []);
-
-      console.log(`✅ Loaded ${users.length} users from SQLite database`);
-
-      res.json({
-        success: true,
-        data: users
-      });
-    } else {
+    if (!isDatabaseAvailable()) {
       return res.status(503).json({
         success: false,
         message: 'Database not available',
         data: []
       });
     }
+
+    const pool = getPostgreSQLPool();
+
+    // Ensure commission_settings column exists safely in PostgreSQL
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS commission_settings TEXT;
+    `).catch(() => {});
+
+    console.log('✅ Loading users with commission settings from PostgreSQL database');
+    const isAgentAccount = String(req.user?.role || '').toLowerCase() === 'agent';
+    
+    let sql = `
+      SELECT u.id, u.id as _id, u.username, u.email, u.full_name, u.role, u.permissions,
+        u.commission_settings, u.position, u.phone, u.is_active, u.last_login, u.created_at,
+        u.created_by_user_id, u.created_by_role, creator.username AS created_by_username,
+        EXISTS(
+          SELECT 1 FROM social_presence presence
+          WHERE presence.user_id = CAST(u.id AS TEXT)
+            AND presence.last_seen >= NOW() - INTERVAL '90 seconds'
+        ) AS is_online
+      FROM users u
+      LEFT JOIN users creator ON CAST(creator.id AS TEXT) = u.created_by_user_id
+    `;
+    
+    let params = [];
+    if (isAgentAccount) {
+      sql += ` WHERE u.created_by_user_id = $1 OR CAST(u.id AS TEXT) = $2`;
+      params = [String(req.user.id), String(req.user.id)];
+    }
+    sql += ` ORDER BY u.created_at DESC`;
+
+    const result = await query(sql, params);
+    
+    // Parse commission_settings JSON for frontend if it's stored as string
+    const formattedRows = result.rows.map(user => {
+      if (user.commission_settings && typeof user.commission_settings === 'string') {
+        try {
+          user.commission_settings = JSON.parse(user.commission_settings);
+        } catch (e) {
+          // Keep as is if not valid JSON
+        }
+      }
+      return user;
+    });
+
+    console.log(`✅ Loaded ${formattedRows.length} users with full details from PostgreSQL`);
+
+    res.json({
+      success: true,
+      data: formattedRows
+    });
   } catch (error) {
     console.error('❌ Get all users error:', error);
     next(error);
@@ -194,118 +210,92 @@ export const getAllUsers = async (req, res, next) => {
 export const updateUser = async (req, res, next) => {
   try {
     const { id } = req.params;
-    
-    console.log('📝 ========== UPDATE USER REQUEST ==========');
-    console.log('📝 User ID:', id);
-    console.log('📝 Request Body:', JSON.stringify(req.body, null, 2));
-    console.log('📝 Body Keys:', Object.keys(req.body));
-    
     const { username, email, password, full_name, role, position, phone, permissions, commission_settings } = req.body;
 
-    const dbAvailable = isDatabaseAvailable();
-
-    if (!dbAvailable) {
-      console.log('❌ Database not available');
+    if (!isDatabaseAvailable()) {
       return res.status(503).json({
         success: false,
         message: 'Database not available'
       });
     }
 
-    const updates = [];
-    const values = [];
+    const pool = getPostgreSQLPool();
 
-    // PRIORITY: Handle commission_settings FIRST
-    if (commission_settings !== undefined) {
-      console.log('✅ FOUND commission_settings in request!');
-      console.log('✅ Value:', commission_settings);
-      console.log('✅ Type:', typeof commission_settings);
-      updates.push('commission_settings = ?');
-      values.push(typeof commission_settings === 'string' ? commission_settings : JSON.stringify(commission_settings));
+    // Ensure commission_settings column exists safely
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS commission_settings TEXT;
+    `).catch(() => {});
+
+    if (phone !== undefined && await hasDuplicatePhoneNumber(pool, phone, id)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Phone number already exists'
+      });
     }
 
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
+
+    if (commission_settings !== undefined) {
+      updates.push(`commission_settings = $${paramIndex++}`);
+      values.push(typeof commission_settings === 'string' ? commission_settings : JSON.stringify(commission_settings));
+    }
     if (username) {
-      updates.push('username = ?');
+      updates.push(`username = $${paramIndex++}`);
       values.push(username);
     }
     if (email !== undefined) {
-      updates.push('email = ?');
+      updates.push(`email = $${paramIndex++}`);
       values.push(email || null);
     }
     if (password) {
       const hashedPassword = await bcrypt.hash(password, 10);
-      updates.push('password_hash = ?');
+      updates.push(`password_hash = $${paramIndex++}`);
       values.push(hashedPassword);
     }
     if (full_name !== undefined) {
-      updates.push('full_name = ?');
+      updates.push(`full_name = $${paramIndex++}`);
       values.push(full_name || null);
     }
     if (role) {
-      updates.push('role = ?');
+      updates.push(`role = $${paramIndex++}`);
       values.push(role);
     }
     if (position !== undefined) {
-      updates.push('position = ?');
+      updates.push(`position = $${paramIndex++}`);
       values.push(position || null);
     }
     if (phone !== undefined) {
-      updates.push('phone = ?');
+      updates.push(`phone = $${paramIndex++}`);
       values.push(phone || null);
     }
     if (permissions !== undefined) {
-      updates.push('permissions = ?');
+      updates.push(`permissions = $${paramIndex++}`);
       values.push(JSON.stringify(permissions));
     }
 
-    console.log('📝 Total updates to make:', updates.length);
-    console.log('📝 Update fields:', updates);
-    console.log('📝 Update values:', values);
-
     if (updates.length === 0) {
-      console.log('❌ NO FIELDS TO UPDATE!');
       return res.status(400).json({
         success: false,
         message: 'No fields to update'
       });
     }
 
+    updates.push(`updated_at = CURRENT_TIMESTAMP`);
     values.push(id);
 
-    const sql = `UPDATE users SET ${updates.join(', ')}, updated_at = datetime('now') WHERE _id = ?`;
+    const sql = `UPDATE users SET ${updates.join(', ')} WHERE id = $${paramIndex}`;
     
-    console.log('📝 Final SQL:', sql);
-    console.log('📝 Final Values:', JSON.stringify(values));
-    
-    try {
-      const result = getDB().transaction(() => {
-        if (phone !== undefined && hasDuplicatePhoneNumber(phone, id)) return null;
-        return query(sql, values);
-      })();
-      if (!result) {
-        return res.status(400).json({
-          success: false,
-          message: 'Phone number already exists'
-        });
-      }
-      console.log(`✅ SUCCESS! User updated: ID ${id}, changes: ${result.changes}`);
-      
-      // Verify the update
-      const verifyStmt = query('SELECT commission_settings FROM users WHERE _id = ?', [id]);
-      console.log('✅ Verification - Saved commission_settings:', verifyStmt[0]?.commission_settings);
-      
-      res.json({
-        success: true,
-        message: 'User updated successfully'
-      });
-    } catch (sqlError) {
-      console.error('❌ SQL Execution Error:', sqlError.message);
-      console.error('❌ SQL Code:', sqlError.code);
-      throw sqlError;
-    }
+    await pool.query(sql, values);
+    console.log(`✅ SUCCESS! User updated with commission settings: ID ${id}`);
+
+    res.json({
+      success: true,
+      message: 'User updated successfully'
+    });
   } catch (error) {
     console.error('❌ Update user error:', error);
-    console.error('❌ Error stack:', error.stack);
     res.status(500).json({
       success: false,
       message: error.message
@@ -318,24 +308,22 @@ export const toggleUserStatus = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    const dbAvailable = isDatabaseAvailable();
-
-    if (dbAvailable) {
-      const sql = 'UPDATE users SET is_active = NOT is_active, updated_at = datetime(\'now\') WHERE _id = ?';
-      query(sql, [id]);
-
-      console.log(`✅ User status toggled in SQLite database: ID ${id}`);
-
-      res.json({
-        success: true,
-        message: 'User status updated successfully'
-      });
-    } else {
+    if (!isDatabaseAvailable()) {
       return res.status(503).json({
         success: false,
         message: 'Database not available'
       });
     }
+
+    const sql = 'UPDATE users SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END, updated_at = CURRENT_TIMESTAMP WHERE id = $1';
+    await query(sql, [id]);
+
+    console.log(`✅ User status toggled in PostgreSQL database: ID ${id}`);
+
+    res.json({
+      success: true,
+      message: 'User status updated successfully'
+    });
   } catch (error) {
     console.error('❌ Toggle user status error:', error);
     next(error);
@@ -347,26 +335,32 @@ export const deleteUser = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    const dbAvailable = isDatabaseAvailable();
-
-    if (dbAvailable) {
-      const sql = 'DELETE FROM users WHERE _id = ?';
-      query(sql, [id]);
-
-      console.log(`✅ User deleted from SQLite database: ID ${id}`);
-
-      res.json({
-        success: true,
-        message: 'User deleted successfully'
-      });
-    } else {
+    if (!isDatabaseAvailable()) {
       return res.status(503).json({
         success: false,
         message: 'Database not available'
       });
     }
+
+    const sql = 'DELETE FROM users WHERE id = $1';
+    await query(sql, [id]);
+
+    console.log(`✅ User deleted from PostgreSQL database: ID ${id}`);
+
+    res.json({
+      success: true,
+      message: 'User deleted successfully'
+    });
   } catch (error) {
     console.error('❌ Delete user error:', error);
     next(error);
   }
+};
+
+export default {
+  createUser,
+  getAllUsers,
+  updateUser,
+  toggleUserStatus,
+  deleteUser
 };
