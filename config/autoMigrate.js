@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 
 /**
  * Auto-migrate database schema on server startup
- * Creates tables and ensures all required user columns (including last_login) exist.
+ * Creates all required tables (including social_presence, users, data_registrations, etc.)
  */
 export const autoMigrateDatabase = async () => {
   console.log('🔄 Running auto-migration (PostgreSQL)...');
@@ -16,7 +16,7 @@ export const autoMigrateDatabase = async () => {
       return false;
     }
 
-    // 1. CREATE TABLES FIRST (Including last_login, commission_settings, etc.)
+    // 1. CREATE USERS TABLE
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -38,7 +38,7 @@ export const autoMigrateDatabase = async () => {
       );
     `);
 
-    // 2. Ensure all required columns exist in 'users' table if it was created previously
+    // Ensure all required columns exist in 'users' table if it was created previously
     await pool.query(`
       ALTER TABLE users ADD COLUMN IF NOT EXISTS commission_settings TEXT;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS created_by_user_id VARCHAR(255);
@@ -50,6 +50,16 @@ export const autoMigrateDatabase = async () => {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS position VARCHAR(100);
     `).catch(() => {});
 
+    // 2. CREATE SOCIAL PRESENCE TABLE (Fixes the current error)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS social_presence (
+        user_id VARCHAR(255) PRIMARY KEY,
+        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // 3. CREATE OTHER ESSENTIAL TABLES
     await pool.query(`
       CREATE TABLE IF NOT EXISTS data_registrations (
         _id SERIAL PRIMARY KEY,
@@ -90,7 +100,7 @@ export const autoMigrateDatabase = async () => {
       );
     `);
 
-    // 3. SYNCHRONIZE ROOT USER
+    // 4. SYNCHRONIZE ROOT USER
     const rootUsername = process.env.ROOT_USERNAME?.trim() || 'root';
     const rootPassword = process.env.ROOT_PASSWORD;
 
@@ -111,7 +121,7 @@ export const autoMigrateDatabase = async () => {
       console.warn('⚠️  ROOT_PASSWORD is not configured; skipping root-user credential migration');
     }
 
-    // 4. CHECK AND ADD MISSING COLUMNS TO data_registrations
+    // 5. CHECK AND ADD MISSING COLUMNS TO data_registrations
     const tableInfoQuery = `
       SELECT column_name as name 
       FROM information_schema.columns 
