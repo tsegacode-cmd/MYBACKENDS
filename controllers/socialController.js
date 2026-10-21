@@ -1,10 +1,37 @@
 import { randomBytes, randomUUID } from 'crypto';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { getRawSQLiteDB } from '../config/sqliteDatabase.js';
-import { recordPlatformPayout } from '../utils/platformFinance.js';
+import { AsyncLocalStorage } from 'async_hooks';
+import { queryNeon, toPostgresPlaceholders, withNeonTransaction } from '../config/neonDatabase.js';
 
-const db = () => getRawSQLiteDB();
+const transactionContext = new AsyncLocalStorage();
+const db = () => ({
+  prepare(sql) {
+    const execute = async params => {
+      let normalizedSql = sql.replace(/"Member"/g, "'Member'");
+      if (normalizedSql.trimStart().startsWith('INSERT OR IGNORE INTO')) normalizedSql = normalizedSql.replace('INSERT OR IGNORE INTO', 'INSERT INTO').trimEnd() + ' ON CONFLICT DO NOTHING';
+      const client = transactionContext.getStore();
+      const result = client ? await client.query(toPostgresPlaceholders(normalizedSql), params) : await queryNeon(normalizedSql, params);
+      for (const row of result.rows) for (const field of result.fields) {
+        const value=row[field.name]; if (![20,1700].includes(field.dataTypeID)||typeof value!=='string') continue;
+        const number=Number(value); if(Number.isFinite(number)&&(field.dataTypeID===1700||Number.isSafeInteger(number))) row[field.name]=number;
+      }
+      return result;
+    };
+    return {
+      get: async (...params)=>(await execute(params)).rows[0],
+      all: async (...params)=>(await execute(params)).rows,
+      run: async (...params)=>{const result=await execute(params);return {changes:result.rowCount,lastInsertRowid:result.rows[0]?._id,rows:result.rows};},
+    };
+  },
+  transaction(callback) {
+    return () => {
+      const existingClient = transactionContext.getStore();
+      if (existingClient) return callback();
+      return withNeonTransaction(client => transactionContext.run(client, callback));
+    };
+  },
+});
 const PHONE_SQL = "replace(replace(replace(replace(replace(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '')";
 const currentId = req => String(req.user.id);
 const isRoot = user => user?.isRoot || ['root', 'admin'].includes(String(user?.role || '').toLowerCase());
@@ -49,34 +76,36 @@ const normalizeTagList = value => normalizeJsonList(value)
   .map(item => String(item).replace(/^@/, '').replace(/^#/, '').trim())
   .filter(Boolean)
   .slice(0, 25);
-const resolveUserIdsByUsernames = usernames => {
+const resolveUserIdsByUsernames = async usernames => {
   const uniqueNames = [...new Set(usernames.map(name => String(name).trim().replace(/^@/, '').toLowerCase()).filter(Boolean))];
   if (!uniqueNames.length) return [];
   const placeholders = uniqueNames.map(() => '?').join(', ');
-  const rows = db().prepare(`
+  const rows = await (db().prepare(`
     SELECT CAST(_id AS TEXT) AS user_id, LOWER(username) AS username
     FROM users
     WHERE LOWER(username) IN (${placeholders}) AND is_active = 1
-  `).all(...uniqueNames);
+  `).all(...uniqueNames));
   return rows.map(row => row.user_id);
 };
-const notifyMentionTargets = (actorId, targetUserIds, postId, defaultType = 'mention') => {
-  const actorName = db().prepare('SELECT COALESCE(full_name, username, "Member") AS name FROM users WHERE CAST(_id AS TEXT) = ?').get(String(actorId))?.name || 'Someone';
+const notifyMentionTargets = async (actorId, targetUserIds, postId, defaultType = 'mention') => {
+  const actor = await db().prepare("SELECT COALESCE(full_name, username, 'Member') AS name FROM users WHERE CAST(_id AS TEXT) = ?")
+    .get(String(actorId));
+  const actorName = actor?.name || 'Someone';
   const seen = new Set();
-  targetUserIds.forEach(targetUserId => {
+  await Promise.all(targetUserIds.map(async targetUserId => {
     const id = String(targetUserId);
     if (!id || id === String(actorId) || seen.has(id)) return;
     seen.add(id);
     const type = defaultType === 'tagged_friend' ? 'tagged_friend' : 'mention';
     const actionText = type === 'tagged_friend' ? 'tagged you in a post.' : 'mentioned you in a post.';
-    notify(id, actorId, type, `${actorName} ${actionText}`, `/feed?post=${encodeURIComponent(postId)}`);
-  });
+    await (notify(id, actorId, type, `${actorName} ${actionText}`, `/feed?post=${encodeURIComponent(postId)}`));
+  }));
 };
-const socialWriteError = userId => {
-  const user = db().prepare(`
+const socialWriteError = async userId => {
+  const user = await (db().prepare(`
     SELECT is_active, social_restricted, social_restriction_reason, social_banned, social_ban_reason
     FROM users WHERE CAST(_id AS TEXT) = ?
-  `).get(String(userId));
+  `).get(String(userId)));
   if (!user) return 'This account is not permitted to publish social content.';
   if (user.social_banned) return `This account is banned${user.social_ban_reason ? `: ${user.social_ban_reason}` : '.'}`;
   if (!user.is_active) return 'This account is not permitted to publish social content.';
@@ -100,44 +129,44 @@ const isValidCallSignal = (type, body) => {
   }
 };
 const json = (res, data, status = 200) => res.status(status).json({ success: true, data });
-const areFriends = (userId, otherUserId) => String(userId) === String(otherUserId) || !!db().prepare(`
+const areFriends = async (userId, otherUserId) => String(userId) === String(otherUserId) || !!await (db().prepare(`
   SELECT 1 FROM social_follows mine
   JOIN social_follows theirs ON theirs.follower_id = mine.followed_id AND theirs.followed_id = mine.follower_id
   WHERE mine.follower_id = ? AND mine.followed_id = ?
-`).get(String(userId), String(otherUserId));
-const hasFollowConnection = (userId, otherUserId) => !!db().prepare(`
+`).get(String(userId), String(otherUserId)));
+const hasFollowConnection = async (userId, otherUserId) => !!await (db().prepare(`
   SELECT 1 FROM social_follows
   WHERE (follower_id = ? AND followed_id = ?)
      OR (follower_id = ? AND followed_id = ?)
-`).get(String(userId), String(otherUserId), String(otherUserId), String(userId));
-const canViewPost = (userId, post) => {
+`).get(String(userId), String(otherUserId), String(otherUserId), String(userId)));
+const canViewPost = async (userId, post) => {
   if (!post) return false;
-  const moderation = db().prepare(`
+  const moderation = await (db().prepare(`
     SELECT p.moderation_status, COALESCE(u.social_banned, 0) AS social_banned
     FROM social_posts p LEFT JOIN users u ON CAST(u._id AS TEXT) = p.user_id
     WHERE p.post_id = ?
-  `).get(post.post_id);
+  `).get(post.post_id));
   if (!moderation || moderation.moderation_status !== 'active' || moderation.social_banned) return false;
   if (post.visibility === 'private' && post.user_id !== String(userId)) return false;
-  if (post.user_id !== String(userId) && post.visibility === 'friends' && !areFriends(userId, post.user_id)) return false;
+  if (post.user_id !== String(userId) && post.visibility === 'friends' && !await (areFriends(userId, post.user_id))) return false;
   if (post.repost_of) {
-    const original = db().prepare('SELECT user_id, visibility, repost_of FROM social_posts WHERE post_id = ?').get(post.repost_of);
-    return original ? canViewPost(userId, original) : false;
+    const original = await (db().prepare('SELECT user_id, visibility, repost_of FROM social_posts WHERE post_id = ?').get(post.repost_of));
+    return original ? await (canViewPost(userId, original)) : false;
   }
   return true;
 };
 
-const notify = (userId, actorId, type, message, link = null) => {
-  db().prepare(`
+const notify = async (userId, actorId, type, message, link = null) => {
+  await (db().prepare(`
     INSERT INTO social_notifications (notification_id, user_id, actor_id, type, message, link)
     VALUES (?, ?, ?, ?, ?, ?)
-  `).run(randomUUID(), String(userId), actorId == null ? null : String(actorId), type, message, link);
+  `).run(randomUUID(), String(userId), actorId == null ? null : String(actorId), type, message, link));
 };
 
-const roleRates = role => {
+const roleRates = async role => {
   const normalizedRole = String(role || 'user').toLowerCase();
-  db().prepare('INSERT OR IGNORE INTO wallet_settings (role) VALUES (?)').run(normalizedRole);
-  return db().prepare('SELECT * FROM wallet_settings WHERE role = ?').get(normalizedRole);
+  await (db().prepare('INSERT OR IGNORE INTO wallet_settings (role) VALUES (?)').run(normalizedRole));
+  return await (db().prepare('SELECT * FROM wallet_settings WHERE role = ?').get(normalizedRole));
 };
 
 const resolveWalletBalanceType = (type, requestedBalanceType = '') => {
@@ -194,91 +223,92 @@ const resolveWalletBalanceType = (type, requestedBalanceType = '') => {
   return 'real';
 };
 
-const creditWallet = (userId, amount, type, reference, description, requestedBalanceType = '') => {
+const creditWallet = async (userId, amount, type, reference, description, requestedBalanceType = '') => {
   const value = Number(amount);
   if (!Number.isFinite(value) || value === 0 || (value < 0 && !['withdrawal', 'admin_adjustment', 'coin_conversion', 'etb_to_coin', 'bonus_to_real_conversion'].includes(String(type || '').toLowerCase()))) return false;
   const roundedValue = Math.round(value * 100) / 100;
   if (roundedValue === 0) return false;
-  const userRole = db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId))?.role;
-  const currency = roleRates(userRole).currency;
+  const user = await db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId));
+  const currency = (await roleRates(user?.role)).currency;
   const balanceType = resolveWalletBalanceType(type, requestedBalanceType);
-  const result = db().prepare(`
+  const result = await (db().prepare(`
     INSERT OR IGNORE INTO wallet_ledger (entry_id, user_id, amount, entry_type, reference, description, currency, balance_type)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(randomUUID(), String(userId), roundedValue, type, reference, description, currency, balanceType);
+  `).run(randomUUID(), String(userId), roundedValue, type, reference, description, currency, balanceType));
   return result.changes === 1;
 };
 
-const creditPlatformReward = (userId, amount, type, reference, description, agentUserId = null, requestedBalanceType = 'bonus') => {
-  const payReward = db().transaction(() => {
-    const credited = creditWallet(userId, amount, type, reference, description, requestedBalanceType);
+const creditPlatformReward = async (userId, amount, type, reference, description, agentUserId = null, requestedBalanceType = 'bonus') => {
+  const payReward = db().transaction(async () => {
+    const credited = await (creditWallet(userId, amount, type, reference, description, requestedBalanceType));
     if (!credited) return false;
-    recordPlatformPayout({
-      userId,
-      agentUserId,
-      amount,
-      requestId: reference,
-      entryType: type,
-      reference: `platform-payout:${reference}`,
-      description,
-    });
+    const payoutAmount = Math.round(Number(amount) * 100) / 100;
+    if (!userId || !reference || !type || !description || !Number.isFinite(payoutAmount) || payoutAmount <= 0) {
+      throw new Error('Platform payout details are invalid.');
+    }
+    await (db().prepare(`
+      INSERT INTO platform_payout_ledger (
+        payout_id, user_id, agent_user_id, amount, request_id, entry_type, reference, description
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(randomUUID(), String(userId), agentUserId == null ? null : String(agentUserId),
+      -payoutAmount, String(reference), String(type), `platform-payout:${reference}`, String(description)));
     return true;
   });
-  return payReward();
+  return await payReward();
 };
 
-const creditCoins = (userId, amount, type, reference, description) => {
+const creditCoins = async (userId, amount, type, reference, description) => {
   const value = Number(amount);
   if (!Number.isSafeInteger(value) || value === 0) return false;
-  const record = db().transaction(() => {
-    const result = db().prepare(`
+  const record = db().transaction(async () => {
+    const result = await (db().prepare(`
       INSERT OR IGNORE INTO wallet_coin_ledger (entry_id, user_id, amount, entry_type, reference, description)
       VALUES (?, ?, ?, ?, ?, ?)
-    `).run(randomUUID(), String(userId), value, type, reference, description);
+    `).run(randomUUID(), String(userId), value, type, reference, description));
     if (result.changes === 1 && value > 0 &&
         !['coin_purchase', 'coin_savings_return', 'coin_admin_adjustment'].includes(String(type))) {
-      awardReachedCoinLevels(userId);
+      await (awardReachedCoinLevels(userId));
     }
     return result.changes === 1;
   });
-  return record();
+  return await record();
 };
 
 export const creditUserCoins = (userId, amount, type, reference, description) =>
   creditCoins(userId, amount, type, reference, description);
-export const getUserCoinBalance = userId => coinBalance(userId);
+export const getUserCoinBalance = async userId => await (coinBalance(userId));
 
-const coinBalance = userId => {
-  settleMaturedCoinSavings(userId);
-  return Number(db().prepare(
+const coinBalance = async userId => {
+  await settleMaturedCoinSavings(userId);
+  return Number(await (db().prepare(
     'SELECT COALESCE(SUM(amount), 0) AS balance FROM wallet_coin_ledger WHERE user_id = ?'
-  ).get(String(userId)).balance);
+  ).get(String(userId))).balance);
 };
 
 const COIN_EARNED_EXCLUDED_TYPES = ['coin_purchase', 'coin_savings_return', 'coin_admin_adjustment'];
-const getLifetimeEarnedCoins = userId => Number(db().prepare(`
+const getLifetimeEarnedCoins = async userId => Number(await (db().prepare(`
   SELECT COALESCE(SUM(amount), 0) AS earned
   FROM wallet_coin_ledger
   WHERE user_id = ? AND amount > 0
     AND entry_type NOT IN (?, ?, ?)
-`).get(String(userId), ...COIN_EARNED_EXCLUDED_TYPES).earned);
+`).get(String(userId), ...COIN_EARNED_EXCLUDED_TYPES)).earned);
 
-const getCoinLevelRules = () => db().prepare(
+const getCoinLevelRules = async () => await (db().prepare(
   'SELECT level, required_coins, reward_etb FROM wallet_coin_level_rules ORDER BY level'
-).all();
+).all());
 
-const awardReachedCoinLevels = userId => {
-  const earnedCoins = getLifetimeEarnedCoins(userId);
+const awardReachedCoinLevels = async userId => {
+  const earnedCoins = await (getLifetimeEarnedCoins(userId));
   if (earnedCoins <= 0) return;
-  const rules = getCoinLevelRules();
+  const rules = await (getCoinLevelRules());
   for (const rule of rules) {
     if (earnedCoins < rule.required_coins) continue;
-    if (db().prepare('SELECT 1 FROM wallet_coin_level_history WHERE user_id = ? AND level = ?')
-      .get(String(userId), rule.level)) continue;
+    if (await (db().prepare('SELECT 1 FROM wallet_coin_level_history WHERE user_id = ? AND level = ?')
+      .get(String(userId), rule.level))) continue;
 
     const reward = Math.round(Number(rule.reward_etb) * 100) / 100;
     const reference = `coin-level-reward:${userId}:${rule.level}`;
-    if (reward > 0 && !creditPlatformReward(
+    if (reward > 0 && !await creditPlatformReward(
       userId,
       reward,
       'coin_level_reward',
@@ -286,14 +316,14 @@ const awardReachedCoinLevels = userId => {
       `ETB bonus for reaching coin level ${rule.level}`,
       null,
       'bonus'
-    ) && !db().prepare('SELECT 1 FROM wallet_ledger WHERE reference = ?').get(reference)) {
+    ) && !await (db().prepare('SELECT 1 FROM wallet_ledger WHERE reference = ?').get(reference))) {
       throw new Error(`Could not credit the level ${rule.level} ETB reward.`);
     }
-    db().prepare(`
+    await (db().prepare(`
       INSERT INTO wallet_coin_level_history (achievement_id, user_id, level, earned_coins, reward_etb)
       VALUES (?, ?, ?, ?, ?)
-    `).run(randomUUID(), String(userId), rule.level, earnedCoins, reward);
-    notify(
+    `).run(randomUUID(), String(userId), rule.level, earnedCoins, reward));
+    await (notify(
       userId,
       null,
       'coin_level_reward',
@@ -301,18 +331,18 @@ const awardReachedCoinLevels = userId => {
         ? `Congratulations! You reached coin level ${rule.level} and earned ETB ${reward.toFixed(2)} bonus.`
         : `Congratulations! You reached coin level ${rule.level}.`,
       '/wallet'
-    );
+    ));
   }
 };
 
-const getCoinLevelProgress = userId => {
-  const earnedCoins = getLifetimeEarnedCoins(userId);
-  const rules = getCoinLevelRules();
+const getCoinLevelProgress = async userId => {
+  const earnedCoins = await (getLifetimeEarnedCoins(userId));
+  const rules = await (getCoinLevelRules());
   const current = rules.filter(rule => earnedCoins >= rule.required_coins).at(-1) || null;
   const next = rules.find(rule => rule.level > (current?.level || 0)) || null;
-  const totalRewardEtb = Number(db().prepare(
+  const totalRewardEtb = Number(await (db().prepare(
     'SELECT COALESCE(SUM(reward_etb), 0) AS total FROM wallet_coin_level_history WHERE user_id = ?'
-  ).get(String(userId)).total);
+  ).get(String(userId))).total);
   return {
     earnedCoins,
     currentLevel: current?.level || 0,
@@ -321,102 +351,103 @@ const getCoinLevelProgress = userId => {
     nextThreshold: next?.required_coins || null,
     totalRewardEtb,
     rules,
-    history: db().prepare(`
+    history: await (db().prepare(`
       SELECT level, earned_coins, reward_etb, created_at
       FROM wallet_coin_level_history WHERE user_id = ? ORDER BY level DESC
-    `).all(String(userId)),
+    `).all(String(userId))),
   };
 };
 
-const settleMaturedCoinSavings = userId => {
-  const settle = db().transaction(() => {
-    const matured = db().prepare(`
+const settleMaturedCoinSavings = async userId => {
+  const settle = db().transaction(async () => {
+    const matured = await (db().prepare(`
       SELECT * FROM wallet_coin_savings
-      WHERE user_id = ? AND status = 'active' AND datetime(maturity_at) <= CURRENT_TIMESTAMP
+      WHERE user_id = ? AND status = 'active' AND maturity_at::timestamptz <= CURRENT_TIMESTAMP
       ORDER BY maturity_at ASC
-    `).all(String(userId));
+    `).all(String(userId)));
     for (const deposit of matured) {
-      if (!creditCoins(
+      if (!await creditCoins(
         userId,
         deposit.principal,
         'coin_savings_return',
         `coin-savings:${deposit.deposit_id}:principal-return`,
         `Returned ${deposit.principal} coins from matured savings`
       )) throw new Error(`Could not return the principal for savings deposit ${deposit.deposit_id}.`);
-      if (deposit.expected_interest > 0 && !creditCoins(
+      if (deposit.expected_interest > 0 && !await creditCoins(
         userId,
         deposit.expected_interest,
         'coin_savings_interest',
         `coin-savings:${deposit.deposit_id}:interest`,
         `Interest earned on ${deposit.principal} coins over ${deposit.duration_days} days`
       )) throw new Error(`Could not credit interest for savings deposit ${deposit.deposit_id}.`);
-      db().prepare(`
-        UPDATE wallet_coin_savings SET status = 'matured', settled_at = CURRENT_TIMESTAMP
+      await (db().prepare(`
+        UPDATE wallet_coin_savings SET status = 'matured', settled_at = CURRENT_TIMESTAMP::text
         WHERE deposit_id = ? AND status = 'active'
-      `).run(deposit.deposit_id);
+      `).run(deposit.deposit_id));
     }
     return matured.length;
   });
-  return settle();
+  return await settle();
 };
 
-export const awardDailyLoginCoins = userId => {
-  const user = db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId));
+export const awardDailyLoginCoins = async userId => {
+  const user = await (db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId)));
   if (!user) return false;
-  const rates = roleRates(user.role);
+  const rates = await (roleRates(user.role));
   const amount = Number(rates.coin_login_reward);
   const day = new Date().toISOString().slice(0, 10);
-  const rewarded = creditCoins(
+  const rewarded = await creditCoins(
     userId,
     amount,
     'coin_daily_login',
     `daily-login:${userId}:${day}`,
     'Daily active login coin reward'
   );
-  if (rewarded) notify(userId, null, 'coin_reward', `🎉 You received ${amount} daily login coins.`, '/wallet');
+  if (rewarded) await (notify(userId, null, 'coin_reward', `🎉 You received ${amount} daily login coins.`, '/wallet'));
   return rewarded;
 };
 
-export const ensureReferralCode = userId => {
-  const found = db().prepare('SELECT referral_code FROM social_referrals WHERE owner_user_id = ?').get(String(userId));
+export const ensureReferralCode = async userId => {
+  const found = await (db().prepare('SELECT referral_code FROM social_referrals WHERE owner_user_id = ?').get(String(userId)));
   if (found) return found.referral_code;
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const code = randomBytes(5).toString('hex').toUpperCase();
     try {
-      db().prepare('INSERT INTO social_referrals (referral_code, owner_user_id) VALUES (?, ?)').run(code, String(userId));
+      await (db().prepare('INSERT INTO social_referrals (referral_code, owner_user_id) VALUES (?, ?)').run(code, String(userId)));
       return code;
     } catch (error) {
-      if (!String(error.message).includes('UNIQUE')) throw error;
+      if (error.code !== '23505') throw error;
     }
   }
   throw new Error('Could not create an invite code.');
 };
 
-export const registerReferredUser = (userId, referralCode) => {
-  const newUser = db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId));
+export const registerReferredUser = async (userId, referralCode) => {
+  const newUser = await (db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId)));
   if (!newUser) return;
-  const config = roleRates(newUser.role);
+  const config = await (roleRates(newUser.role));
   const inviter = referralCode
-    ? db().prepare('SELECT owner_user_id FROM social_referrals WHERE referral_code = ?').get(String(referralCode).trim().toUpperCase())
+    ? await (db().prepare('SELECT owner_user_id FROM social_referrals WHERE referral_code = ?').get(String(referralCode).trim().toUpperCase()))
     : null;
   const validInviter = inviter && String(inviter.owner_user_id) !== String(userId) ? inviter : null;
-  const signupBonusPaid = creditPlatformReward(userId, config.signup_bonus, 'signup_bonus', `signup:${userId}`, 'Account welcome bonus');
-  if (signupBonusPaid) notify(userId, null, 'signup_bonus', `Your ${config.signup_bonus.toFixed(2)} welcome bonus was added to your wallet.`, '/wallet');
+  const signupBonusPaid = await creditPlatformReward(userId, config.signup_bonus, 'signup_bonus', `signup:${userId}`, 'Account welcome bonus');
+  if (signupBonusPaid) await (notify(userId, null, 'signup_bonus', `Your ${config.signup_bonus.toFixed(2)} welcome bonus was added to your wallet.`, '/wallet'));
   if (validInviter) {
     const inviterId = String(validInviter.owner_user_id);
-    const inviterUser = db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(inviterId));
-    const inviterConfig = roleRates(inviterUser?.role);
-    const join = db().prepare('INSERT OR IGNORE INTO social_referral_joins (new_user_id, inviter_user_id, referral_code) VALUES (?, ?, ?)')
-      .run(String(userId), inviterId, String(referralCode).trim().toUpperCase());
+    const inviterUser = await (db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(inviterId)));
+    const inviterConfig = await (roleRates(inviterUser?.role));
+    const join = await (db().prepare('INSERT OR IGNORE INTO social_referral_joins (new_user_id, inviter_user_id, referral_code) VALUES (?, ?, ?)')
+      .run(String(userId), inviterId, String(referralCode).trim().toUpperCase()));
     if (join.changes === 1) {
-      db().prepare('INSERT OR IGNORE INTO social_follows (follower_id, followed_id) VALUES (?, ?)').run(String(userId), inviterId);
-      const newUsername = db().prepare('SELECT username FROM users WHERE _id = ?').get(Number(userId))?.username || 'new member';
+      await (db().prepare('INSERT OR IGNORE INTO social_follows (follower_id, followed_id) VALUES (?, ?)').run(String(userId), inviterId));
+      const newUser = await db().prepare('SELECT username FROM users WHERE _id = ?').get(Number(userId));
+      const newUsername = newUser?.username || 'new member';
       if (inviterConfig.invite_reward_trigger === 'registration' || inviterConfig.invite_reward_trigger === 'both') {
-        creditPlatformReward(inviterId, inviterConfig.invite_reward, 'invite_reward', `invite:${userId}`, `Invite bonus for ${newUsername}`);
-        creditCoins(inviterId, inviterConfig.coin_invite_reward, 'coin_invite_reward', `coin-invite:${userId}`, `Invite coins for ${newUsername}`);
+        await creditPlatformReward(inviterId, inviterConfig.invite_reward, 'invite_reward', `invite:${userId}`, `Invite bonus for ${newUsername}`);
+        await creditCoins(inviterId, inviterConfig.coin_invite_reward, 'coin_invite_reward', `coin-invite:${userId}`, `Invite coins for ${newUsername}`);
       }
-      notify(inviterId, userId, 'invite', `${newUsername} joined using your invite link.`, '/friends');
-      notify(userId, inviterId, 'follow', 'You are now following your inviter.', '/friends');
+      await (notify(inviterId, userId, 'invite', `${newUsername} joined using your invite link.`, '/friends'));
+      await (notify(userId, inviterId, 'follow', 'You are now following your inviter.', '/friends'));
     }
   }
 };
@@ -441,15 +472,15 @@ export const registerAccount = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Enter a valid email address.' });
     }
     const cleanReferralCode = String(referralCode || '').trim().toUpperCase();
-    if (cleanReferralCode && !db().prepare('SELECT 1 FROM social_referrals WHERE referral_code = ?').get(cleanReferralCode)) {
+    if (cleanReferralCode && !await (db().prepare('SELECT 1 FROM social_referrals WHERE referral_code = ?').get(cleanReferralCode))) {
       return res.status(400).json({ success: false, message: 'The invite link is invalid or expired.' });
     }
     const passwordHash = await bcrypt.hash(password, 10);
-    const create = db().transaction(() => {
-      const ticket = db().prepare(`
+    const create = db().transaction(async () => {
+      const ticket = await (db().prepare(`
         SELECT contact_type, contact, phone FROM registration_otp_tickets
-        WHERE challenge_id = ? AND used_at IS NULL AND created_at >= datetime('now', '-10 minutes')
-      `).get(registrationChallengeId);
+        WHERE challenge_id = ? AND used_at IS NULL AND created_at::timestamptz >= NOW() - INTERVAL '10 minutes'
+      `).get(registrationChallengeId));
       const submittedContact = ticket?.contact_type === 'telegram'
         ? submittedTelegramChatId
         : ticket?.contact_type === 'email'
@@ -460,43 +491,44 @@ export const registerAccount = async (req, res, next) => {
         error.status = 403;
         throw error;
       }
-      if (ticket.contact_type === 'telegram' && db().prepare('SELECT 1 FROM users WHERE telegram_chat_id = ?').get(ticket.contact)) {
+      if (ticket.contact_type === 'telegram' && await (db().prepare('SELECT 1 FROM users WHERE telegram_chat_id = ?').get(ticket.contact))) {
         const error = new Error('This Telegram account is already linked to an account. Try logging in instead.');
         error.status = 409;
         throw error;
       }
       const userEmail = email ? String(email).trim().toLowerCase() : null;
       const userPhone = submittedPhone;
-      if (userEmail && db().prepare('SELECT 1 FROM users WHERE lower(trim(email)) = ?').get(userEmail)) {
+      if (userEmail && await (db().prepare('SELECT 1 FROM users WHERE lower(trim(email)) = ?').get(userEmail))) {
         const error = new Error('That email address is already registered.');
         error.status = 409;
         throw error;
       }
-      if (db().prepare(`SELECT 1 FROM users WHERE ${PHONE_SQL} = ?`).get(normalizedPhone)) {
+      if (await (db().prepare(`SELECT 1 FROM users WHERE ${PHONE_SQL} = ?`).get(normalizedPhone))) {
         const error = new Error('That phone number is already registered.');
         error.status = 409;
         throw error;
       }
-      const consumeTicket = db().prepare(`
-        UPDATE registration_otp_tickets SET used_at = datetime('now')
+      const consumeTicket = await (db().prepare(`
+        UPDATE registration_otp_tickets SET used_at = CURRENT_TIMESTAMP::text
         WHERE challenge_id = ? AND used_at IS NULL
-      `).run(registrationChallengeId);
+      `).run(registrationChallengeId));
       if (consumeTicket.changes !== 1) {
         const error = new Error('This OTP verification has already been used.');
         error.status = 403;
         throw error;
       }
-      const result = db().prepare(`
+      const result = await (db().prepare(`
         INSERT INTO users (username, email, password_hash, full_name, role, position, phone, telegram_chat_id, is_active, created_by_role)
         VALUES (?, ?, ?, ?, 'user', ?, ?, ?, 1, 'self')
-      `).run(cleanUsername, userEmail, passwordHash, String(full_name || '').trim() || null, null, userPhone, ticket.contact_type === 'telegram' ? ticket.contact : null);
-      registerReferredUser(result.lastInsertRowid, cleanReferralCode);
-      awardDailyLoginCoins(result.lastInsertRowid);
-      ensureReferralCode(result.lastInsertRowid);
+        RETURNING _id
+      `).run(cleanUsername, userEmail, passwordHash, String(full_name || '').trim() || null, null, userPhone, ticket.contact_type === 'telegram' ? ticket.contact : null));
+      await (registerReferredUser(result.lastInsertRowid, cleanReferralCode));
+      await (awardDailyLoginCoins(result.lastInsertRowid));
+      await (ensureReferralCode(result.lastInsertRowid));
       return result.lastInsertRowid;
     });
-    const userId = create();
-    const user = db().prepare('SELECT _id AS id, username, email, full_name, role, position, phone, is_active FROM users WHERE _id = ?').get(userId);
+    const userId = await create();
+    const user = await (db().prepare('SELECT _id AS id, username, email, full_name, role, position, phone, is_active FROM users WHERE _id = ?').get(userId));
     const token = jwt.sign(
       { id: String(user.id), email: user.email, username: user.username, role: user.role },
       process.env.JWT_SECRET,
@@ -507,17 +539,17 @@ export const registerAccount = async (req, res, next) => {
     if ([400, 403, 409].includes(error.status)) {
       return res.status(error.status).json({ success: false, message: error.message });
     }
-    if (String(error.message).includes('UNIQUE constraint failed')) {
+    if (error.code === '23505') {
       return res.status(409).json({ success: false, message: 'That username or email is already registered.' });
     }
     next(error);
   }
 };
 
-export const getFeed = (req, res, next) => {
+export const getFeed = async (req, res, next) => {
   try {
     const userId = currentId(req);
-    const posts = db().prepare(`
+    const posts = await (db().prepare(`
       SELECT p.post_id, p.user_id, p.content, p.product_name, p.product_price, p.product_url, p.product_image,
         p.location, p.mentions, p.hashtags, p.tagged_friends, p.repost_of, p.visibility, p.created_at,
         original.content AS original_content, original.product_name AS original_product_name,
@@ -528,7 +560,7 @@ export const getFeed = (req, res, next) => {
         u.position, u.role,
         EXISTS(SELECT 1 FROM social_presence presence
           WHERE presence.user_id = CAST(u._id AS TEXT)
-            AND presence.last_seen >= datetime('now', '-90 seconds')) AS is_online,
+            AND presence.last_seen::timestamptz >= NOW() - INTERVAL '90 seconds') AS is_online,
         (SELECT COUNT(*) FROM social_post_likes l WHERE l.post_id = p.post_id) AS likes,
         EXISTS(SELECT 1 FROM social_post_likes l WHERE l.post_id = p.post_id AND l.user_id = ?) AS liked,
         (SELECT COUNT(*) FROM social_post_shares s WHERE s.post_id = p.post_id) AS shares,
@@ -553,15 +585,15 @@ export const getFeed = (req, res, next) => {
         ))
       ))
       ORDER BY boosted DESC, p.created_at DESC LIMIT 100
-    `).all(userId, userId, userId, userId, userId, userId);
+    `).all(userId, userId, userId, userId, userId, userId));
     json(res, posts);
   } catch (error) { next(error); }
 };
 
-export const getRootFeedManagement = (req, res, next) => {
+export const getRootFeedManagement = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
-    const posts = db().prepare(`
+    const posts = await (db().prepare(`
       SELECT p.post_id, p.user_id, p.content, p.product_name, p.product_price, p.product_url, p.product_image,
         p.location, p.mentions, p.hashtags, p.tagged_friends, p.repost_of, p.visibility, p.moderation_status, p.moderation_reason, p.moderated_at, p.created_at,
         COALESCE(u.username, 'Unavailable account') AS username,
@@ -575,8 +607,8 @@ export const getRootFeedManagement = (req, res, next) => {
       LEFT JOIN users u ON CAST(u._id AS TEXT) = p.user_id
       ORDER BY CASE WHEN p.moderation_status = 'hidden' THEN 0 ELSE 1 END, p.created_at DESC
       LIMIT 200
-    `).all();
-    const reports = db().prepare(`
+    `).all());
+    const reports = await (db().prepare(`
       SELECT r.report_id, r.post_id, r.reporter_user_id, r.reason, r.details, r.status,
         r.review_reason, r.reviewed_at, r.created_at,
         reporter.username AS reporter_username,
@@ -590,15 +622,15 @@ export const getRootFeedManagement = (req, res, next) => {
       LEFT JOIN users poster ON CAST(poster._id AS TEXT) = p.user_id
       ORDER BY CASE r.status WHEN 'open' THEN 0 ELSE 1 END, r.created_at DESC
       LIMIT 500
-    `).all();
+    `).all());
     json(res, { posts, reports });
   } catch (error) { next(error); }
 };
 
-export const getRootStories = (req, res, next) => {
+export const getRootStories = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
-    const stories = db().prepare(`
+    const stories = await (db().prepare(`
       SELECT s.story_id, s.user_id, s.body, s.image_data, s.cover_color, s.created_at, s.expires_at,
         COALESCE(u.username, 'Unavailable account') AS username,
         COALESCE(u.full_name, u.username, 'Unavailable account') AS full_name,
@@ -607,15 +639,15 @@ export const getRootStories = (req, res, next) => {
         (SELECT COUNT(*) FROM social_story_shares sh WHERE sh.story_id = s.story_id) AS shares
       FROM social_stories s
       LEFT JOIN users u ON CAST(u._id AS TEXT) = s.user_id
-      WHERE s.expires_at > CURRENT_TIMESTAMP
+      WHERE s.expires_at::timestamptz > CURRENT_TIMESTAMP
       ORDER BY s.created_at DESC
       LIMIT 200
-    `).all();
+    `).all());
     json(res, stories);
   } catch (error) { next(error); }
 };
 
-export const removeRootStory = (req, res, next) => {
+export const removeRootStory = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
     const storyId = String(req.params.storyId || '');
@@ -623,21 +655,21 @@ export const removeRootStory = (req, res, next) => {
     if (!validText(reason, 500)) {
       return res.status(400).json({ success: false, message: 'Provide a removal reason of up to 500 characters.' });
     }
-    const story = db().prepare('SELECT story_id, user_id FROM social_stories WHERE story_id = ?').get(storyId);
+    const story = await (db().prepare('SELECT story_id, user_id FROM social_stories WHERE story_id = ?').get(storyId));
     if (!story) return res.status(404).json({ success: false, message: 'Story not found.' });
 
-    const remove = db().transaction(() => {
+    const remove = db().transaction(async () => {
       for (const table of ['social_story_likes', 'social_story_comments', 'social_story_shares']) {
-        db().prepare(`DELETE FROM ${table} WHERE story_id = ?`).run(storyId);
+        await (db().prepare(`DELETE FROM ${table} WHERE story_id = ?`).run(storyId));
       }
-      const result = db().prepare('DELETE FROM social_stories WHERE story_id = ?').run(storyId);
+      const result = await (db().prepare('DELETE FROM social_stories WHERE story_id = ?').run(storyId));
       if (result.changes !== 1) return false;
-      db().prepare(`
+      await (db().prepare(`
         INSERT INTO social_story_moderation_log
           (moderation_id, story_id, target_user_id, moderator_user_id, action, reason)
         VALUES (?, ?, ?, ?, 'remove', ?)
-      `).run(randomUUID(), storyId, story.user_id, currentId(req), reason);
-      notify(story.user_id, currentId(req), 'content_moderation', `Your story was removed. Reason: ${reason}`, '/feed');
+      `).run(randomUUID(), storyId, story.user_id, currentId(req), reason));
+      await (notify(story.user_id, currentId(req), 'content_moderation', `Your story was removed. Reason: ${reason}`, '/feed'));
       return true;
     });
     if (!remove()) return res.status(404).json({ success: false, message: 'Story not found.' });
@@ -645,15 +677,15 @@ export const removeRootStory = (req, res, next) => {
   } catch (error) { next(error); }
 };
 
-export const reportPost = (req, res, next) => {
+export const reportPost = async (req, res, next) => {
   try {
     const postId = String(req.params.postId || '');
     const reporterId = currentId(req);
     const reason = String(req.body?.reason || '').trim();
     const details = String(req.body?.details || '').trim();
     const allowedReasons = ['spam', 'harassment', 'hate', 'scam', 'misinformation', 'inappropriate', 'other'];
-    const post = db().prepare('SELECT post_id, user_id, visibility, repost_of FROM social_posts WHERE post_id = ?').get(postId);
-    if (!post || !canViewPost(reporterId, post)) {
+    const post = await (db().prepare('SELECT post_id, user_id, visibility, repost_of FROM social_posts WHERE post_id = ?').get(postId));
+    if (!post || !await (canViewPost(reporterId, post))) {
       return res.status(404).json({ success: false, message: 'Post not found.' });
     }
     if (post.user_id === reporterId) {
@@ -664,12 +696,12 @@ export const reportPost = (req, res, next) => {
     }
     const reportId = randomUUID();
     try {
-      db().prepare(`
+      await (db().prepare(`
         INSERT INTO social_post_reports (report_id, post_id, reporter_user_id, reason, details)
         VALUES (?, ?, ?, ?, ?)
-      `).run(reportId, postId, reporterId, reason, details || null);
+      `).run(reportId, postId, reporterId, reason, details || null));
     } catch (error) {
-      if (String(error.message).includes('UNIQUE constraint failed')) {
+      if (error.code === '23505') {
         return res.status(409).json({ success: false, message: 'You have already reported this post.' });
       }
       throw error;
@@ -678,7 +710,7 @@ export const reportPost = (req, res, next) => {
   } catch (error) { next(error); }
 };
 
-export const moderateRootPost = (req, res, next) => {
+export const moderateRootPost = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
     const postId = String(req.params.postId || '');
@@ -688,12 +720,12 @@ export const moderateRootPost = (req, res, next) => {
     if (!allowedActions.includes(action) || !validText(reason, 500)) {
       return res.status(400).json({ success: false, message: 'Choose a valid moderation action and provide a reason of up to 500 characters.' });
     }
-    const post = db().prepare(`
+    const post = await (db().prepare(`
       SELECT p.post_id, p.user_id, p.moderation_status, u.username, u.is_active, u.social_restricted, u.social_banned,
         u.social_ban_previous_active
       FROM social_posts p LEFT JOIN users u ON CAST(u._id AS TEXT) = p.user_id
       WHERE p.post_id = ?
-    `).get(postId);
+    `).get(postId));
     if (!post) return res.status(404).json({ success: false, message: 'Post not found.' });
     if (['restrict', 'unrestrict', 'ban', 'unban'].includes(action) && !post.username) {
       return res.status(404).json({ success: false, message: 'The poster account could not be found.' });
@@ -709,64 +741,64 @@ export const moderateRootPost = (req, res, next) => {
 
     const moderatorId = currentId(req);
     const moderationId = randomUUID();
-    const update = db().transaction(() => {
+    const update = db().transaction(async () => {
       if (action === 'hide' || action === 'restore') {
-        db().prepare(`
+        await (db().prepare(`
           UPDATE social_posts
-          SET moderation_status = ?, moderation_reason = ?, moderated_by = ?, moderated_at = CURRENT_TIMESTAMP
+          SET moderation_status = ?, moderation_reason = ?, moderated_by = ?, moderated_at = CURRENT_TIMESTAMP::text
           WHERE post_id = ?
         `).run(action === 'hide' ? 'hidden' : 'active', action === 'hide' ? reason : null,
-          moderatorId, postId);
+          moderatorId, postId));
       } else if (action === 'restrict') {
-        db().prepare(`
-          UPDATE users SET social_restricted = 1, social_restriction_reason = ?, updated_at = CURRENT_TIMESTAMP
+        await (db().prepare(`
+          UPDATE users SET social_restricted = 1, social_restriction_reason = ?, updated_at = CURRENT_TIMESTAMP::text
           WHERE CAST(_id AS TEXT) = ?
-        `).run(reason, post.user_id);
+        `).run(reason, post.user_id));
       } else if (action === 'unrestrict') {
-        db().prepare(`
-          UPDATE users SET social_restricted = 0, social_restriction_reason = NULL, updated_at = CURRENT_TIMESTAMP
+        await (db().prepare(`
+          UPDATE users SET social_restricted = 0, social_restriction_reason = NULL, updated_at = CURRENT_TIMESTAMP::text
           WHERE CAST(_id AS TEXT) = ?
-        `).run(post.user_id);
+        `).run(post.user_id));
       } else if (action === 'ban') {
-        db().prepare(`
+        await (db().prepare(`
           UPDATE users
           SET social_banned = 1, social_ban_reason = ?, social_ban_previous_active = is_active,
-            is_active = 0, updated_at = CURRENT_TIMESTAMP
+            is_active = 0, updated_at = CURRENT_TIMESTAMP::text
           WHERE CAST(_id AS TEXT) = ?
-        `).run(reason, post.user_id);
+        `).run(reason, post.user_id));
       } else {
-        db().prepare(`
+        await (db().prepare(`
           UPDATE users
           SET social_banned = 0, social_ban_reason = NULL, is_active = social_ban_previous_active,
-            social_ban_previous_active = 1, updated_at = CURRENT_TIMESTAMP
+            social_ban_previous_active = 1, updated_at = CURRENT_TIMESTAMP::text
           WHERE CAST(_id AS TEXT) = ?
-        `).run(post.user_id);
+        `).run(post.user_id));
       }
 
-      db().prepare(`
+      await (db().prepare(`
         INSERT INTO social_moderation_log (moderation_id, post_id, target_user_id, moderator_user_id, action, reason)
         VALUES (?, ?, ?, ?, ?, ?)
-      `).run(moderationId, postId, post.user_id, moderatorId, action, reason);
+      `).run(moderationId, postId, post.user_id, moderatorId, action, reason));
 
       if (['hide', 'restrict', 'ban'].includes(action)) {
-        db().prepare(`
+        await (db().prepare(`
           UPDATE social_post_reports
-          SET status = 'actioned', reviewed_by = ?, review_reason = ?, reviewed_at = CURRENT_TIMESTAMP
+          SET status = 'actioned', reviewed_by = ?, review_reason = ?, reviewed_at = CURRENT_TIMESTAMP::text
           WHERE post_id = ? AND status = 'open'
-        `).run(moderatorId, reason, postId);
+        `).run(moderatorId, reason, postId));
       }
       const actionLabel = {
         hide: 'hidden', restore: 'restored', restrict: 'restricted from social publishing',
         unrestrict: 'restored to social publishing', ban: 'banned', unban: 'unbanned'
       }[action];
-      notify(post.user_id, moderatorId, 'content_moderation', `Your post/account was ${actionLabel}. Reason: ${reason}`, '/feed');
+      await (notify(post.user_id, moderatorId, 'content_moderation', `Your post/account was ${actionLabel}. Reason: ${reason}`, '/feed'));
     });
-    update();
+    await update();
     json(res, { postId, userId: post.user_id, action, reason });
   } catch (error) { next(error); }
 };
 
-export const updateRootPostReport = (req, res, next) => {
+export const updateRootPostReport = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
     const status = String(req.body?.status || '');
@@ -774,20 +806,20 @@ export const updateRootPostReport = (req, res, next) => {
     if (!['actioned', 'dismissed'].includes(status) || !validText(reason, 500)) {
       return res.status(400).json({ success: false, message: 'Choose actioned or dismissed and provide a review reason of up to 500 characters.' });
     }
-    const result = db().prepare(`
+    const result = await (db().prepare(`
       UPDATE social_post_reports
-      SET status = ?, reviewed_by = ?, review_reason = ?, reviewed_at = CURRENT_TIMESTAMP
+      SET status = ?, reviewed_by = ?, review_reason = ?, reviewed_at = CURRENT_TIMESTAMP::text
       WHERE report_id = ? AND status = 'open'
-    `).run(status, currentId(req), reason, String(req.params.reportId || ''));
+    `).run(status, currentId(req), reason, String(req.params.reportId || '')));
     if (result.changes !== 1) return res.status(404).json({ success: false, message: 'Open report not found.' });
     json(res, { reportId: req.params.reportId, status, reason });
   } catch (error) { next(error); }
 };
 
-export const createPost = (req, res, next) => {
+export const createPost = async (req, res, next) => {
   try {
     const userId = currentId(req);
-    const writeError = socialWriteError(userId);
+    const writeError = await (socialWriteError(userId));
     if (writeError) return res.status(403).json({ success: false, message: writeError });
     const content = String(req.body?.content || '').trim();
     const productName = String(req.body?.productName || '').trim();
@@ -806,8 +838,8 @@ export const createPost = (req, res, next) => {
     const hashtagFromContent = extractHashtags(content);
     const effectiveMentions = [...new Set([...mentions, ...mentionFromContent])].slice(0, 25);
     const effectiveHashtags = [...new Set([...hashtags, ...hashtagFromContent])].slice(0, 25);
-    const mentionUserIds = resolveUserIdsByUsernames(effectiveMentions);
-    const taggedFriendIds = resolveUserIdsByUsernames(taggedFriends);
+    const mentionUserIds = await (resolveUserIdsByUsernames(effectiveMentions));
+    const taggedFriendIds = await (resolveUserIdsByUsernames(taggedFriends));
     if ((!content && !productName) || content.length > 2000 || productName.length > 160 ||
         location.length > 160 ||
         (price !== null && (!Number.isFinite(price) || price < 0)) || productUrl.length > 500 ||
@@ -818,39 +850,39 @@ export const createPost = (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Enter a post or product with valid details.' });
     }
     const postId = randomUUID();
-    const create = db().transaction(() => {
-      db().prepare(`
+    const create = db().transaction(async () => {
+      await (db().prepare(`
       INSERT INTO social_posts (post_id, user_id, content, product_name, product_price, product_url, product_image, location, mentions, hashtags, tagged_friends, visibility)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(postId, userId, content, productName || null, price, productUrl || null, productImage, location, JSON.stringify(effectiveMentions), JSON.stringify(effectiveHashtags), JSON.stringify(taggedFriends), visibility);
-      const followers = db().prepare(`
+      `).run(postId, userId, content, productName || null, price, productUrl || null, productImage, location, JSON.stringify(effectiveMentions), JSON.stringify(effectiveHashtags), JSON.stringify(taggedFriends), visibility));
+      const followers = await (db().prepare(`
         SELECT f.follower_id FROM social_follows f
         WHERE f.followed_id = ? AND (? = 'public' OR ? = 'friends' AND EXISTS (
           SELECT 1 FROM social_follows reciprocal
           WHERE reciprocal.follower_id = ? AND reciprocal.followed_id = f.follower_id
         ))
-      `).all(userId, visibility, visibility, userId);
-      followers.forEach(follower => notify(follower.follower_id, userId, 'new_post', 'Someone you follow published a post.', '/feed'));
-      notifyMentionTargets(userId, mentionUserIds, postId, 'mention');
-      notifyMentionTargets(userId, taggedFriendIds, postId, 'tagged_friend');
+      `).all(userId, visibility, visibility, userId));
+      await Promise.all(followers.map(async follower => await (notify(follower.follower_id, userId, 'new_post', 'Someone you follow published a post.', '/feed'))));
+      await (notifyMentionTargets(userId, mentionUserIds, postId, 'mention'));
+      await (notifyMentionTargets(userId, taggedFriendIds, postId, 'tagged_friend'));
     });
-    create();
-    const created = db().prepare('SELECT * FROM social_posts WHERE post_id = ?').get(postId);
+    await create();
+    const created = await (db().prepare('SELECT * FROM social_posts WHERE post_id = ?').get(postId));
     json(res, created, 201);
   } catch (error) { next(error); }
 };
 
-export const deletePost = (req, res, next) => {
+export const deletePost = async (req, res, next) => {
   try {
     const postId = req.params.postId;
     const userId = currentId(req);
-    const post = db().prepare('SELECT post_id, user_id FROM social_posts WHERE post_id = ?').get(postId);
+    const post = await (db().prepare('SELECT post_id, user_id FROM social_posts WHERE post_id = ?').get(postId));
     if (!post || post.user_id !== userId) {
       return res.status(404).json({ success: false, message: 'Post not found.' });
     }
 
-    const deleteTree = db().transaction(() => {
-      const postIds = db().prepare(`
+    const deleteTree = db().transaction(async () => {
+      const postIds = await (db().prepare(`
         WITH RECURSIVE post_tree(post_id) AS (
           SELECT post_id FROM social_posts WHERE post_id = ?
           UNION ALL
@@ -858,43 +890,43 @@ export const deletePost = (req, res, next) => {
           JOIN post_tree parent ON child.repost_of = parent.post_id
         )
         SELECT post_id FROM post_tree
-      `).all(postId).map(item => item.post_id);
+      `).all(postId)).map(item => item.post_id);
       const placeholders = postIds.map(() => '?').join(', ');
       for (const table of ['social_post_likes', 'social_post_shares', 'social_post_comments']) {
-        db().prepare(`DELETE FROM ${table} WHERE post_id IN (${placeholders})`).run(...postIds);
+        await (db().prepare(`DELETE FROM ${table} WHERE post_id IN (${placeholders})`).run(...postIds));
       }
-      db().prepare(`DELETE FROM social_posts WHERE post_id IN (${placeholders})`).run(...postIds);
+      await (db().prepare(`DELETE FROM social_posts WHERE post_id IN (${placeholders})`).run(...postIds));
       return postIds;
     });
-    const deletedPostIds = deleteTree();
+    const deletedPostIds = await deleteTree();
     json(res, { deleted: true, postIds: deletedPostIds });
   } catch (error) { next(error); }
 };
 
-export const likePost = (req, res, next) => {
+export const likePost = async (req, res, next) => {
   try {
     const { postId } = req.params;
     const userId = currentId(req);
-    const post = db().prepare('SELECT post_id, user_id, visibility, repost_of FROM social_posts WHERE post_id = ?').get(postId);
+    const post = await (db().prepare('SELECT post_id, user_id, visibility, repost_of FROM social_posts WHERE post_id = ?').get(postId));
     if (!post) return res.status(404).json({ success: false, message: 'Post not found.' });
-    if (!canViewPost(userId, post)) return res.status(404).json({ success: false, message: 'Post not found.' });
-    const exists = db().prepare('SELECT 1 FROM social_post_likes WHERE post_id = ? AND user_id = ?').get(postId, userId);
-    if (exists) db().prepare('DELETE FROM social_post_likes WHERE post_id = ? AND user_id = ?').run(postId, userId);
+    if (!await (canViewPost(userId, post))) return res.status(404).json({ success: false, message: 'Post not found.' });
+    const exists = await (db().prepare('SELECT 1 FROM social_post_likes WHERE post_id = ? AND user_id = ?').get(postId, userId));
+    if (exists) await (db().prepare('DELETE FROM social_post_likes WHERE post_id = ? AND user_id = ?').run(postId, userId));
     else {
-      db().prepare('INSERT INTO social_post_likes (post_id, user_id) VALUES (?, ?)').run(postId, userId);
-      if (post.user_id !== userId) notify(post.user_id, userId, 'like', 'Someone liked your post.', '/feed');
+      await (db().prepare('INSERT INTO social_post_likes (post_id, user_id) VALUES (?, ?)').run(postId, userId));
+      if (post.user_id !== userId) await (notify(post.user_id, userId, 'like', 'Someone liked your post.', '/feed'));
     }
-    const likes = db().prepare('SELECT COUNT(*) AS count FROM social_post_likes WHERE post_id = ?').get(postId).count;
+    const likes = await (db().prepare('SELECT COUNT(*) AS count FROM social_post_likes WHERE post_id = ?').get(postId)).count;
     json(res, { liked: !exists, likes });
   } catch (error) { next(error); }
 };
 
-export const getPostComments = (req, res, next) => {
+export const getPostComments = async (req, res, next) => {
   try {
-    const post = db().prepare('SELECT post_id, user_id, visibility, repost_of FROM social_posts WHERE post_id = ?').get(req.params.postId);
+    const post = await (db().prepare('SELECT post_id, user_id, visibility, repost_of FROM social_posts WHERE post_id = ?').get(req.params.postId));
     if (!post) return res.status(404).json({ success: false, message: 'Post not found.' });
-    if (!canViewPost(currentId(req), post)) return res.status(404).json({ success: false, message: 'Post not found.' });
-    const comments = db().prepare(`
+    if (!await (canViewPost(currentId(req), post))) return res.status(404).json({ success: false, message: 'Post not found.' });
+    const comments = await (db().prepare(`
       SELECT c.comment_id, c.post_id, c.user_id, c.body, c.created_at,
         COALESCE(u.username, 'Member') AS username,
         COALESCE(u.full_name, u.username, 'Member') AS full_name
@@ -902,65 +934,66 @@ export const getPostComments = (req, res, next) => {
       LEFT JOIN users u ON CAST(u._id AS TEXT) = c.user_id
       WHERE c.post_id = ?
       ORDER BY c.created_at ASC LIMIT 200
-    `).all(req.params.postId);
+    `).all(req.params.postId));
     json(res, comments);
   } catch (error) { next(error); }
 };
 
-export const createPostComment = (req, res, next) => {
+export const createPostComment = async (req, res, next) => {
   try {
-    const writeError = socialWriteError(currentId(req));
+    const writeError = await (socialWriteError(currentId(req)));
     if (writeError) return res.status(403).json({ success: false, message: writeError });
-    const post = db().prepare('SELECT post_id, user_id, visibility, repost_of FROM social_posts WHERE post_id = ?').get(req.params.postId);
+    const post = await (db().prepare('SELECT post_id, user_id, visibility, repost_of FROM social_posts WHERE post_id = ?').get(req.params.postId));
     if (!post) return res.status(404).json({ success: false, message: 'Post not found.' });
-    if (!canViewPost(currentId(req), post)) return res.status(404).json({ success: false, message: 'Post not found.' });
+    if (!await (canViewPost(currentId(req), post))) return res.status(404).json({ success: false, message: 'Post not found.' });
     const body = String(req.body?.body || '').trim();
     if (!validText(body, 1000)) return res.status(400).json({ success: false, message: 'Comments must contain up to 1,000 characters.' });
     const commentId = randomUUID();
-    db().prepare('INSERT INTO social_post_comments (comment_id, post_id, user_id, body) VALUES (?, ?, ?, ?)')
-      .run(commentId, post.post_id, currentId(req), body);
+    await (db().prepare('INSERT INTO social_post_comments (comment_id, post_id, user_id, body) VALUES (?, ?, ?, ?)')
+      .run(commentId, post.post_id, currentId(req), body));
     if (post.user_id !== currentId(req)) {
-      notify(post.user_id, currentId(req), 'comment', 'Someone commented on your post.', `/feed?post=${encodeURIComponent(post.post_id)}`);
+      await (notify(post.user_id, currentId(req), 'comment', 'Someone commented on your post.', `/feed?post=${encodeURIComponent(post.post_id)}`));
     }
-    const comment = db().prepare(`
+    const comment = await (db().prepare(`
       SELECT c.comment_id, c.post_id, c.user_id, c.body, c.created_at,
         COALESCE(u.username, 'Member') AS username,
         COALESCE(u.full_name, u.username, 'Member') AS full_name
       FROM social_post_comments c LEFT JOIN users u ON CAST(u._id AS TEXT) = c.user_id
       WHERE c.comment_id = ?
-    `).get(commentId);
+    `).get(commentId));
     json(res, comment, 201);
   } catch (error) { next(error); }
 };
 
-export const sharePost = (req, res, next) => {
+export const sharePost = async (req, res, next) => {
   try {
     const userId = currentId(req);
     const { postId } = req.params;
-    const post = db().prepare('SELECT post_id, user_id, visibility, repost_of FROM social_posts WHERE post_id = ?').get(postId);
+    const post = await (db().prepare('SELECT post_id, user_id, visibility, repost_of FROM social_posts WHERE post_id = ?').get(postId));
     if (!post) return res.status(404).json({ success: false, message: 'Post not found.' });
-    if (!canViewPost(userId, post)) return res.status(404).json({ success: false, message: 'Post not found.' });
-    const transaction = db().transaction(() => {
-      const shared = db().prepare('INSERT OR IGNORE INTO social_post_shares (post_id, user_id) VALUES (?, ?)').run(postId, userId);
-      const role = db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId))?.role;
-      const rates = roleRates(role);
+    if (!await (canViewPost(userId, post))) return res.status(404).json({ success: false, message: 'Post not found.' });
+    const transaction = db().transaction(async () => {
+      const shared = await (db().prepare('INSERT OR IGNORE INTO social_post_shares (post_id, user_id) VALUES (?, ?)').run(postId, userId));
+      const user = await db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId));
+      const role = user?.role;
+      const rates = await (roleRates(role));
       if (shared.changes === 1) {
-        const rewarded = creditPlatformReward(userId, rates.share_reward, 'share_reward', `share:${postId}:${userId}`, 'Reward for sharing a post');
-        if (rewarded) notify(userId, null, 'share_reward', `Your ${rates.share_reward.toFixed(2)} post-share reward was added to your wallet.`, '/wallet');
-        const coinRewarded = creditCoins(userId, rates.coin_share_reward, 'coin_share_reward', `coin-share:${postId}:${userId}`, 'Coins for sharing a post');
-        if (coinRewarded) notify(userId, null, 'coin_reward', `🎉 You received ${rates.coin_share_reward} coins for sharing a post.`, '/wallet');
-        if (post.user_id !== userId) notify(post.user_id, userId, 'share', 'Someone shared your post.', '/feed');
+        const rewarded = await creditPlatformReward(userId, rates.share_reward, 'share_reward', `share:${postId}:${userId}`, 'Reward for sharing a post');
+        if (rewarded) await (notify(userId, null, 'share_reward', `Your ${rates.share_reward.toFixed(2)} post-share reward was added to your wallet.`, '/wallet'));
+        const coinRewarded = await creditCoins(userId, rates.coin_share_reward, 'coin_share_reward', `coin-share:${postId}:${userId}`, 'Coins for sharing a post');
+        if (coinRewarded) await (notify(userId, null, 'coin_reward', `🎉 You received ${rates.coin_share_reward} coins for sharing a post.`, '/wallet'));
+        if (post.user_id !== userId) await (notify(post.user_id, userId, 'share', 'Someone shared your post.', '/feed'));
       }
       return shared.changes === 1;
     });
-    json(res, { shared: transaction() });
+    json(res, { shared: await transaction() });
   } catch (error) { next(error); }
 };
 
-export const getStories = (req, res, next) => {
+export const getStories = async (req, res, next) => {
   try {
     const userId = currentId(req);
-    const stories = db().prepare(`
+    const stories = await (db().prepare(`
       SELECT s.story_id, s.user_id, s.body, s.image_data, s.cover_color, s.created_at, s.expires_at,
         COALESCE(u.username, 'Member') AS username,
         COALESCE(u.full_name, u.username, 'Member') AS full_name,
@@ -970,16 +1003,16 @@ export const getStories = (req, res, next) => {
         (SELECT COUNT(*) FROM social_story_shares sh WHERE sh.story_id = s.story_id) AS shares
       FROM social_stories s
       LEFT JOIN users u ON CAST(u._id AS TEXT) = s.user_id
-      WHERE s.expires_at > CURRENT_TIMESTAMP AND COALESCE(u.social_banned, 0) = 0
+      WHERE s.expires_at::timestamptz > CURRENT_TIMESTAMP AND COALESCE(u.social_banned, 0) = 0
       ORDER BY s.created_at DESC LIMIT 100
-    `).all(userId);
+    `).all(userId));
     json(res, stories);
   } catch (error) { next(error); }
 };
 
-export const createStory = (req, res, next) => {
+export const createStory = async (req, res, next) => {
   try {
-    const writeError = socialWriteError(currentId(req));
+    const writeError = await (socialWriteError(currentId(req)));
     if (writeError) return res.status(403).json({ success: false, message: writeError });
     const body = String(req.body?.body || '').trim();
     const coverColor = String(req.body?.coverColor || '#8b0000');
@@ -998,129 +1031,129 @@ export const createStory = (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Choose a valid image smaller than 1.3 MB.' });
     }
     const storyId = randomUUID();
-    db().prepare(`
+    await (db().prepare(`
       INSERT INTO social_stories (story_id, user_id, body, image_data, cover_color, expires_at)
-      VALUES (?, ?, ?, ?, ?, datetime('now', '+24 hours'))
-    `).run(storyId, currentId(req), body, imageData, coverColor);
-    const story = db().prepare(`
+      VALUES (?, ?, ?, ?, ?, (NOW() + INTERVAL '24 hours')::text)
+    `).run(storyId, currentId(req), body, imageData, coverColor));
+    const story = await (db().prepare(`
       SELECT s.story_id, s.user_id, s.body, s.image_data, s.cover_color, s.created_at, s.expires_at,
         COALESCE(u.username, 'Member') AS username,
         COALESCE(u.full_name, u.username, 'Member') AS full_name,
         0 AS likes, 0 AS liked, 0 AS comments, 0 AS shares
       FROM social_stories s LEFT JOIN users u ON CAST(u._id AS TEXT) = s.user_id
       WHERE s.story_id = ?
-    `).get(storyId);
+    `).get(storyId));
     json(res, story, 201);
   } catch (error) { next(error); }
 };
 
-export const likeStory = (req, res, next) => {
+export const likeStory = async (req, res, next) => {
   try {
-    const story = db().prepare('SELECT story_id, user_id FROM social_stories WHERE story_id = ? AND expires_at > CURRENT_TIMESTAMP')
-      .get(req.params.storyId);
+    const story = await (db().prepare('SELECT story_id, user_id FROM social_stories WHERE story_id = ? AND expires_at::timestamptz > CURRENT_TIMESTAMP')
+      .get(req.params.storyId));
     if (!story) return res.status(404).json({ success: false, message: 'Story not found or expired.' });
     const userId = currentId(req);
-    const exists = db().prepare('SELECT 1 FROM social_story_likes WHERE story_id = ? AND user_id = ?')
-      .get(story.story_id, userId);
-    if (exists) db().prepare('DELETE FROM social_story_likes WHERE story_id = ? AND user_id = ?').run(story.story_id, userId);
+    const exists = await (db().prepare('SELECT 1 FROM social_story_likes WHERE story_id = ? AND user_id = ?')
+      .get(story.story_id, userId));
+    if (exists) await (db().prepare('DELETE FROM social_story_likes WHERE story_id = ? AND user_id = ?').run(story.story_id, userId));
     else {
-      db().prepare('INSERT INTO social_story_likes (story_id, user_id) VALUES (?, ?)').run(story.story_id, userId);
-      if (story.user_id !== userId) notify(story.user_id, userId, 'story_like', 'Someone liked your story.', '/feed');
+      await (db().prepare('INSERT INTO social_story_likes (story_id, user_id) VALUES (?, ?)').run(story.story_id, userId));
+      if (story.user_id !== userId) await (notify(story.user_id, userId, 'story_like', 'Someone liked your story.', '/feed'));
     }
-    const likes = db().prepare('SELECT COUNT(*) AS count FROM social_story_likes WHERE story_id = ?').get(story.story_id).count;
+    const likes = await (db().prepare('SELECT COUNT(*) AS count FROM social_story_likes WHERE story_id = ?').get(story.story_id)).count;
     json(res, { liked: !exists, likes });
   } catch (error) { next(error); }
 };
 
-export const getStoryComments = (req, res, next) => {
+export const getStoryComments = async (req, res, next) => {
   try {
-    const story = db().prepare('SELECT story_id FROM social_stories WHERE story_id = ? AND expires_at > CURRENT_TIMESTAMP')
-      .get(req.params.storyId);
+    const story = await (db().prepare('SELECT story_id FROM social_stories WHERE story_id = ? AND expires_at::timestamptz > CURRENT_TIMESTAMP')
+      .get(req.params.storyId));
     if (!story) return res.status(404).json({ success: false, message: 'Story not found or expired.' });
-    const comments = db().prepare(`
+    const comments = await (db().prepare(`
       SELECT c.comment_id, c.story_id, c.user_id, c.body, c.created_at,
         COALESCE(u.username, 'Member') AS username,
         COALESCE(u.full_name, u.username, 'Member') AS full_name
       FROM social_story_comments c LEFT JOIN users u ON CAST(u._id AS TEXT) = c.user_id
       WHERE c.story_id = ? ORDER BY c.created_at ASC LIMIT 200
-    `).all(story.story_id);
+    `).all(story.story_id));
     json(res, comments);
   } catch (error) { next(error); }
 };
 
-export const createStoryComment = (req, res, next) => {
+export const createStoryComment = async (req, res, next) => {
   try {
-    const writeError = socialWriteError(currentId(req));
+    const writeError = await (socialWriteError(currentId(req)));
     if (writeError) return res.status(403).json({ success: false, message: writeError });
-    const story = db().prepare('SELECT story_id, user_id FROM social_stories WHERE story_id = ? AND expires_at > CURRENT_TIMESTAMP')
-      .get(req.params.storyId);
+    const story = await (db().prepare('SELECT story_id, user_id FROM social_stories WHERE story_id = ? AND expires_at::timestamptz > CURRENT_TIMESTAMP')
+      .get(req.params.storyId));
     if (!story) return res.status(404).json({ success: false, message: 'Story not found or expired.' });
     const body = String(req.body?.body || '').trim();
     if (!validText(body, 1000)) return res.status(400).json({ success: false, message: 'Comments must contain up to 1,000 characters.' });
     const commentId = randomUUID();
-    db().prepare('INSERT INTO social_story_comments (comment_id, story_id, user_id, body) VALUES (?, ?, ?, ?)')
-      .run(commentId, story.story_id, currentId(req), body);
-    if (story.user_id !== currentId(req)) notify(story.user_id, currentId(req), 'story_comment', 'Someone commented on your story.', '/feed');
-    const comment = db().prepare(`
+    await (db().prepare('INSERT INTO social_story_comments (comment_id, story_id, user_id, body) VALUES (?, ?, ?, ?)')
+      .run(commentId, story.story_id, currentId(req), body));
+    if (story.user_id !== currentId(req)) await (notify(story.user_id, currentId(req), 'story_comment', 'Someone commented on your story.', '/feed'));
+    const comment = await (db().prepare(`
       SELECT c.comment_id, c.story_id, c.user_id, c.body, c.created_at,
         COALESCE(u.username, 'Member') AS username,
         COALESCE(u.full_name, u.username, 'Member') AS full_name
       FROM social_story_comments c LEFT JOIN users u ON CAST(u._id AS TEXT) = c.user_id
       WHERE c.comment_id = ?
-    `).get(commentId);
+    `).get(commentId));
     json(res, comment, 201);
   } catch (error) { next(error); }
 };
 
-export const shareStory = (req, res, next) => {
+export const shareStory = async (req, res, next) => {
   try {
-    const story = db().prepare('SELECT story_id, user_id FROM social_stories WHERE story_id = ? AND expires_at > CURRENT_TIMESTAMP')
-      .get(req.params.storyId);
+    const story = await (db().prepare('SELECT story_id, user_id FROM social_stories WHERE story_id = ? AND expires_at::timestamptz > CURRENT_TIMESTAMP')
+      .get(req.params.storyId));
     if (!story) return res.status(404).json({ success: false, message: 'Story not found or expired.' });
-    const result = db().prepare('INSERT OR IGNORE INTO social_story_shares (story_id, user_id) VALUES (?, ?)')
-      .run(story.story_id, currentId(req));
+    const result = await (db().prepare('INSERT OR IGNORE INTO social_story_shares (story_id, user_id) VALUES (?, ?)')
+      .run(story.story_id, currentId(req)));
     if (result.changes && story.user_id !== currentId(req)) {
-      notify(story.user_id, currentId(req), 'story_share', 'Someone shared your story.', '/feed');
+      await (notify(story.user_id, currentId(req), 'story_share', 'Someone shared your story.', '/feed'));
     }
     json(res, { shared: true });
   } catch (error) { next(error); }
 };
 
-export const repostPost = (req, res, next) => {
+export const repostPost = async (req, res, next) => {
   try {
-    const writeError = socialWriteError(currentId(req));
+    const writeError = await (socialWriteError(currentId(req)));
     if (writeError) return res.status(403).json({ success: false, message: writeError });
     const sourceId = req.params.postId;
-    const source = db().prepare('SELECT * FROM social_posts WHERE post_id = ?').get(sourceId);
+    const source = await (db().prepare('SELECT * FROM social_posts WHERE post_id = ?').get(sourceId));
     if (!source) return res.status(404).json({ success: false, message: 'Post not found.' });
     const userId = currentId(req);
-    if (!canViewPost(userId, source)) return res.status(404).json({ success: false, message: 'Post not found.' });
+    if (!await (canViewPost(userId, source))) return res.status(404).json({ success: false, message: 'Post not found.' });
     if (source.visibility !== 'public') {
       return res.status(403).json({ success: false, message: 'Only public posts can be reposted.' });
     }
     const repostId = randomUUID();
-    db().prepare(`
+    await (db().prepare(`
       INSERT INTO social_posts (post_id, user_id, content, repost_of, visibility)
       VALUES (?, ?, ?, ?, ?)
-    `).run(repostId, userId, String(req.body?.comment || '').trim().slice(0, 1000), sourceId, source.visibility);
-    notify(source.user_id, userId, 'repost', 'Someone reposted your post.', '/feed');
+    `).run(repostId, userId, String(req.body?.comment || '').trim().slice(0, 1000), sourceId, source.visibility));
+    await (notify(source.user_id, userId, 'repost', 'Someone reposted your post.', '/feed'));
     json(res, { postId: repostId }, 201);
   } catch (error) { next(error); }
 };
 
-export const getPersonProfile = (req, res, next) => {
+export const getPersonProfile = async (req, res, next) => {
   try {
     const viewerId = currentId(req);
     const numericUserId = Number(req.params.userId);
     if (!Number.isSafeInteger(numericUserId) || numericUserId < 1) {
       return res.status(404).json({ success: false, message: 'Profile not found.' });
     }
-    const profile = db().prepare(`
+    const profile = await (db().prepare(`
       SELECT CAST(u._id AS TEXT) AS user_id, u.username, COALESCE(u.full_name, u.username) AS full_name,
         u.position, u.role, u.created_at,
         EXISTS(SELECT 1 FROM social_presence presence
           WHERE presence.user_id = CAST(u._id AS TEXT)
-            AND presence.last_seen >= datetime('now', '-90 seconds')) AS is_online,
+            AND presence.last_seen::timestamptz >= NOW() - INTERVAL '90 seconds') AS is_online,
         (SELECT COUNT(*) FROM social_posts p WHERE p.user_id = CAST(u._id AS TEXT)) AS post_count,
         (SELECT COUNT(*) FROM social_follows f
           WHERE f.followed_id = CAST(u._id AS TEXT)
@@ -1132,9 +1165,9 @@ export const getPersonProfile = (req, res, next) => {
           JOIN social_follows theirs ON theirs.follower_id = mine.followed_id AND theirs.followed_id = mine.follower_id
           WHERE mine.follower_id = ? AND mine.followed_id = CAST(u._id AS TEXT)) AS is_friend
       FROM users u WHERE u._id = ? AND u.is_active = 1
-    `).get(viewerId, viewerId, numericUserId);
+    `).get(viewerId, viewerId, numericUserId));
     if (!profile) return res.status(404).json({ success: false, message: 'Profile not found.' });
-    const posts = db().prepare(`
+    const posts = await (db().prepare(`
       SELECT p.post_id, p.user_id, p.content, p.product_name, p.product_price, p.product_url, p.product_image,
         p.location, p.mentions, p.hashtags, p.tagged_friends, p.repost_of, p.visibility, p.created_at,
         original.content AS original_content, original.product_name AS original_product_name,
@@ -1143,7 +1176,7 @@ export const getPersonProfile = (req, res, next) => {
         u.position, u.role,
         EXISTS(SELECT 1 FROM social_presence presence
           WHERE presence.user_id = CAST(u._id AS TEXT)
-            AND presence.last_seen >= datetime('now', '-90 seconds')) AS is_online,
+            AND presence.last_seen::timestamptz >= NOW() - INTERVAL '90 seconds') AS is_online,
         (SELECT COUNT(*) FROM social_post_likes l WHERE l.post_id = p.post_id) AS likes,
         EXISTS(SELECT 1 FROM social_post_likes l WHERE l.post_id = p.post_id AND l.user_id = ?) AS liked,
         (SELECT COUNT(*) FROM social_post_shares s WHERE s.post_id = p.post_id) AS shares,
@@ -1171,22 +1204,22 @@ export const getPersonProfile = (req, res, next) => {
         ))
       ORDER BY p.created_at DESC
       LIMIT 50
-    `).all(viewerId, viewerId, profile.user_id, viewerId, viewerId, viewerId, viewerId);
+    `).all(viewerId, viewerId, profile.user_id, viewerId, viewerId, viewerId, viewerId));
     json(res, { ...profile, posts });
   } catch (error) { next(error); }
 };
 
-export const getPeople = (req, res, next) => {
+export const getPeople = async (req, res, next) => {
   try {
     const userId = currentId(req);
     const query = String(req.query.q || '').trim().slice(0, 80);
-    const people = db().prepare(`
+    const people = await (db().prepare(`
       SELECT CAST(u._id AS TEXT) AS user_id, u.username, COALESCE(u.full_name, u.username) AS full_name,
         COALESCE(NULLIF(TRIM(u.role), ''), 'user') AS role,
         u.is_active, u.created_at,
         EXISTS(SELECT 1 FROM social_presence presence
           WHERE presence.user_id = CAST(u._id AS TEXT)
-            AND presence.last_seen >= datetime('now', '-90 seconds')) AS is_online,
+            AND presence.last_seen::timestamptz >= NOW() - INTERVAL '90 seconds') AS is_online,
         EXISTS(SELECT 1 FROM social_follows f WHERE f.follower_id = ? AND f.followed_id = CAST(u._id AS TEXT)) AS following,
         (SELECT status FROM social_friend_requests r WHERE r.requester_id = ? AND r.recipient_id = CAST(u._id AS TEXT)) AS sent_request,
         (SELECT status FROM social_friend_requests r WHERE r.requester_id = CAST(u._id AS TEXT) AND r.recipient_id = ?) AS received_request
@@ -1197,78 +1230,78 @@ export const getPeople = (req, res, next) => {
     `).all(
       userId, userId, userId, userId, query,
       `%${query}%`, `%${query}%`, `%${query}%`
-    );
+    ));
     json(res, people);
   } catch (error) { next(error); }
 };
 
-export const followPerson = (req, res, next) => {
+export const followPerson = async (req, res, next) => {
   try {
     const follower = currentId(req);
     const followed = String(req.params.userId);
     if (follower === followed) return res.status(400).json({ success: false, message: 'You cannot follow your own account.' });
-    const user = db().prepare('SELECT username FROM users WHERE _id = ? AND is_active = 1').get(Number(followed));
+    const user = await (db().prepare('SELECT username FROM users WHERE _id = ? AND is_active = 1').get(Number(followed)));
     if (!user) return res.status(404).json({ success: false, message: 'Account not found.' });
-    const followedResult = db().prepare('INSERT OR IGNORE INTO social_follows (follower_id, followed_id) VALUES (?, ?)').run(follower, followed);
-    if (followedResult.changes === 1) notify(followed, follower, 'follow', 'Someone started following you.', '/friends');
+    const followedResult = await (db().prepare('INSERT OR IGNORE INTO social_follows (follower_id, followed_id) VALUES (?, ?)').run(follower, followed));
+    if (followedResult.changes === 1) await (notify(followed, follower, 'follow', 'Someone started following you.', '/friends'));
     json(res, { following: true });
   } catch (error) { next(error); }
 };
 
-export const unfollowPerson = (req, res, next) => {
+export const unfollowPerson = async (req, res, next) => {
   try {
-    db().prepare('DELETE FROM social_follows WHERE follower_id = ? AND followed_id = ?').run(currentId(req), String(req.params.userId));
+    await (db().prepare('DELETE FROM social_follows WHERE follower_id = ? AND followed_id = ?').run(currentId(req), String(req.params.userId)));
     json(res, { following: false });
   } catch (error) { next(error); }
 };
 
-export const getFriends = (req, res, next) => {
+export const getFriends = async (req, res, next) => {
   try {
     const userId = currentId(req);
-    const following = db().prepare(`
+    const following = await (db().prepare(`
       SELECT f.followed_id AS user_id, u.username, COALESCE(u.full_name, u.username) AS full_name, u.role,
         EXISTS(SELECT 1 FROM social_presence presence
           WHERE presence.user_id = f.followed_id
-            AND presence.last_seen >= datetime('now', '-90 seconds')) AS is_online
+            AND presence.last_seen::timestamptz >= NOW() - INTERVAL '90 seconds') AS is_online
       FROM social_follows f JOIN users u ON CAST(u._id AS TEXT) = f.followed_id
       WHERE f.follower_id = ? ORDER BY u.username
-    `).all(userId);
-    const followers = db().prepare(`
+    `).all(userId));
+    const followers = await (db().prepare(`
       SELECT f.follower_id AS user_id, u.username, COALESCE(u.full_name, u.username) AS full_name, u.role,
         EXISTS(SELECT 1 FROM social_presence presence
           WHERE presence.user_id = f.follower_id
-            AND presence.last_seen >= datetime('now', '-90 seconds')) AS is_online
+            AND presence.last_seen::timestamptz >= NOW() - INTERVAL '90 seconds') AS is_online
       FROM social_follows f JOIN users u ON CAST(u._id AS TEXT) = f.follower_id
       WHERE f.followed_id = ? ORDER BY u.username
-    `).all(userId);
-    const requests = db().prepare(`
+    `).all(userId));
+    const requests = await (db().prepare(`
       SELECT r.request_id, r.requester_id AS user_id, u.username, COALESCE(u.full_name, u.username) AS full_name,
         u.role, r.created_at,
         EXISTS(SELECT 1 FROM social_presence presence
           WHERE presence.user_id = r.requester_id
-            AND presence.last_seen >= datetime('now', '-90 seconds')) AS is_online
+            AND presence.last_seen::timestamptz >= NOW() - INTERVAL '90 seconds') AS is_online
       FROM social_friend_requests r JOIN users u ON CAST(u._id AS TEXT) = r.requester_id
       WHERE r.recipient_id = ? AND r.status = 'pending' ORDER BY r.created_at DESC
-    `).all(userId);
-    const sent = db().prepare(`
+    `).all(userId));
+    const sent = await (db().prepare(`
       SELECT r.request_id, r.recipient_id AS user_id, u.username, COALESCE(u.full_name, u.username) AS full_name,
         u.role, r.status,
         EXISTS(SELECT 1 FROM social_presence presence
           WHERE presence.user_id = r.recipient_id
-            AND presence.last_seen >= datetime('now', '-90 seconds')) AS is_online
+            AND presence.last_seen::timestamptz >= NOW() - INTERVAL '90 seconds') AS is_online
       FROM social_friend_requests r JOIN users u ON CAST(u._id AS TEXT) = r.recipient_id
       WHERE r.requester_id = ? AND r.status = 'pending' ORDER BY r.created_at DESC
-    `).all(userId);
+    `).all(userId));
     json(res, { following, followers, requests, sent });
   } catch (error) { next(error); }
 };
 
-export const requestFriend = (req, res, next) => {
+export const requestFriend = async (req, res, next) => {
   try {
     const requester = currentId(req);
     const recipient = String(req.params.userId);
     if (requester === recipient) return res.status(400).json({ success: false, message: 'You cannot add yourself.' });
-    const recipientUser = db().prepare('SELECT username FROM users WHERE _id = ? AND is_active = 1').get(Number(recipient));
+    const recipientUser = await (db().prepare('SELECT username FROM users WHERE _id = ? AND is_active = 1').get(Number(recipient)));
     if (!recipientUser) return res.status(404).json({ success: false, message: 'Account not found.' });
     const friendRequest = {
       requestId: randomUUID(),
@@ -1276,54 +1309,54 @@ export const requestFriend = (req, res, next) => {
       recipient,
       status: 'pending',
     };
-    db().prepare(`
+    await (db().prepare(`
       INSERT INTO social_friend_requests (request_id, requester_id, recipient_id, status)
       VALUES (?, ?, ?, 'pending')
-      ON CONFLICT(requester_id, recipient_id) DO UPDATE SET request_id = excluded.request_id, status = 'pending', updated_at = CURRENT_TIMESTAMP
-    `).run(friendRequest.requestId, requester, recipient);
-    notify(recipient, requester, 'friend_request', 'You received a friend request.', '/friends');
+      ON CONFLICT(requester_id, recipient_id) DO UPDATE SET request_id = excluded.request_id, status = 'pending', updated_at = CURRENT_TIMESTAMP::text
+    `).run(friendRequest.requestId, requester, recipient));
+    await (notify(recipient, requester, 'friend_request', 'You received a friend request.', '/friends'));
     json(res, { sent: true }, 201);
   } catch (error) { next(error); }
 };
 
-export const respondFriendRequest = (req, res, next) => {
+export const respondFriendRequest = async (req, res, next) => {
   try {
     const { status } = req.body || {};
     if (!['accepted', 'declined'].includes(status)) return res.status(400).json({ success: false, message: 'Choose accepted or declined.' });
-    const request = db().prepare('SELECT * FROM social_friend_requests WHERE request_id = ? AND recipient_id = ? AND status = ?')
-      .get(req.params.requestId, currentId(req), 'pending');
+    const request = await (db().prepare('SELECT * FROM social_friend_requests WHERE request_id = ? AND recipient_id = ? AND status = ?')
+      .get(req.params.requestId, currentId(req), 'pending'));
     if (!request) return res.status(404).json({ success: false, message: 'Friend request not found.' });
-    const transaction = db().transaction(() => {
-      db().prepare('UPDATE social_friend_requests SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE request_id = ?')
-        .run(status, request.request_id);
+    const transaction = db().transaction(async () => {
+      await (db().prepare('UPDATE social_friend_requests SET status = ?, updated_at = CURRENT_TIMESTAMP::text WHERE request_id = ?')
+        .run(status, request.request_id));
       if (status === 'accepted') {
-        db().prepare('INSERT OR IGNORE INTO social_follows (follower_id, followed_id) VALUES (?, ?), (?, ?)')
-          .run(request.requester_id, request.recipient_id, request.recipient_id, request.requester_id);
-        notify(request.requester_id, request.recipient_id, 'friend_accepted', 'Your friend request was accepted.', '/friends');
+        await (db().prepare('INSERT OR IGNORE INTO social_follows (follower_id, followed_id) VALUES (?, ?), (?, ?)')
+          .run(request.requester_id, request.recipient_id, request.recipient_id, request.requester_id));
+        await (notify(request.requester_id, request.recipient_id, 'friend_accepted', 'Your friend request was accepted.', '/friends'));
       }
     });
-    transaction();
+    await transaction();
     json(res, { status });
   } catch (error) { next(error); }
 };
 
-export const getMessages = (req, res, next) => {
+export const getMessages = async (req, res, next) => {
   try {
     const me = currentId(req);
     const other = String(req.query.userId || '');
     if (!other || other === me) return res.status(400).json({ success: false, message: 'Choose another account to message.' });
-    const isFollowing = db().prepare('SELECT 1 FROM social_follows WHERE follower_id = ? AND followed_id = ?').get(me, other);
-    const isFollowed = db().prepare('SELECT 1 FROM social_follows WHERE follower_id = ? AND followed_id = ?').get(other, me);
-    const existingConversation = db().prepare(`
+    const isFollowing = await (db().prepare('SELECT 1 FROM social_follows WHERE follower_id = ? AND followed_id = ?').get(me, other));
+    const isFollowed = await (db().prepare('SELECT 1 FROM social_follows WHERE follower_id = ? AND followed_id = ?').get(other, me));
+    const existingConversation = await (db().prepare(`
       SELECT 1 FROM social_messages
       WHERE (sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?)
       LIMIT 1
-    `).get(me, other, other, me);
+    `).get(me, other, other, me));
     if (!isRoot(req.user) && !isFollowing && !isFollowed && !existingConversation) {
       return res.status(403).json({ success: false, message: 'Follow this account before messaging.' });
     }
-    const queryMessages = (afterMessage = null) => db().prepare(`
-      SELECT m.rowid AS message_order, m.message_id, m.sender_id, m.recipient_id,
+    const queryMessages = async (afterMessage = null) => await (db().prepare(`
+      SELECT m.message_id, m.sender_id, m.recipient_id,
         CASE WHEN m.deleted_at IS NULL THEN m.body ELSE '' END AS body,
         m.caption, m.type, m.created_at, m.read_at, m.edited_at, m.deleted_at,
         m.reply_to_message_id, m.forwarded_from_message_id,
@@ -1340,29 +1373,33 @@ export const getMessages = (req, res, next) => {
       LEFT JOIN social_messages forwarded ON forwarded.message_id = m.forwarded_from_message_id
       LEFT JOIN users forward_user ON CAST(forward_user._id AS TEXT) = forwarded.sender_id
       WHERE ((m.sender_id = ? AND m.recipient_id = ?) OR (m.sender_id = ? AND m.recipient_id = ?))
-        AND (? IS NULL OR m.rowid > ?)
-      ORDER BY m.rowid DESC LIMIT 200
+        AND (
+          ?::timestamptz IS NULL OR
+          (m.created_at::timestamptz, m.message_id) > (?::timestamptz, ?)
+        )
+      ORDER BY m.created_at::timestamptz DESC, m.message_id DESC LIMIT 200
     `).all(
       me, other, other, me,
-      afterMessage?.message_order || null,
-      afterMessage?.message_order || null,
-    ).reverse();
+      afterMessage?.created_at || null,
+      afterMessage?.created_at || null,
+      afterMessage?.message_id || null,
+    )).reverse();
     const afterId = String(req.query.after || '');
     const afterMessage = afterId
-      ? db().prepare(`
-        SELECT rowid AS message_order FROM social_messages
+      ? await (db().prepare(`
+        SELECT message_id, created_at FROM social_messages
         WHERE message_id = ?
           AND ((sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?))
-      `).get(afterId, me, other, other, me) || null
+      `).get(afterId, me, other, other, me)) || null
       : null;
-    const conversation = queryMessages(afterMessage);
-    db().prepare('UPDATE social_messages SET read_at = CURRENT_TIMESTAMP WHERE sender_id = ? AND recipient_id = ? AND read_at IS NULL')
-      .run(other, me);
+    const conversation = await (queryMessages(afterMessage));
+    await (db().prepare('UPDATE social_messages SET read_at = CURRENT_TIMESTAMP::text WHERE sender_id = ? AND recipient_id = ? AND read_at IS NULL')
+      .run(other, me));
     json(res, conversation);
   } catch (error) { next(error); }
 };
 
-export const sendMessage = (req, res, next) => {
+export const sendMessage = async (req, res, next) => {
   try {
     const sender = currentId(req);
     const recipient = String(req.body?.recipientId || '');
@@ -1382,32 +1419,32 @@ export const sendMessage = (req, res, next) => {
         : ['call-offer', 'call-answer', 'call-end'].includes(type) &&
           body.length <= 100000 && isValidCallSignal(type, body);
     if (!recipient || recipient === sender || !allowedTypes.includes(type) || !validBody ||
-      (type !== 'image' && caption) || (replyToMessageId && !db().prepare(`
+      (type !== 'image' && caption) || (replyToMessageId && !await (db().prepare(`
         SELECT 1 FROM social_messages
         WHERE message_id = ? AND ((sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?))
-      `).get(replyToMessageId, sender, recipient, recipient, sender))) {
+      `).get(replyToMessageId, sender, recipient, recipient, sender)))) {
       return res.status(400).json({ success: false, message: 'Enter a valid text, image, voice, or call message.' });
     }
-    const canMessage = db().prepare(`
+    const canMessage = await (db().prepare(`
       SELECT 1 FROM social_follows WHERE (follower_id = ? AND followed_id = ?) OR (follower_id = ? AND followed_id = ?)
-    `).get(sender, recipient, recipient, sender);
-    const existingConversation = db().prepare(`
+    `).get(sender, recipient, recipient, sender));
+    const existingConversation = await (db().prepare(`
       SELECT 1 FROM social_messages
       WHERE (sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?)
       LIMIT 1
-    `).get(sender, recipient, recipient, sender);
+    `).get(sender, recipient, recipient, sender));
     if (!isRoot(req.user) && !canMessage && !existingConversation) {
       return res.status(403).json({ success: false, message: 'Follow this account before messaging.' });
     }
     if (type !== 'text') {
-      const recipientExists = db().prepare('SELECT 1 FROM users WHERE CAST(_id AS TEXT) = ? AND is_active = 1').get(recipient);
+      const recipientExists = await (db().prepare('SELECT 1 FROM users WHERE CAST(_id AS TEXT) = ? AND is_active = 1').get(recipient));
       if (!recipientExists) return res.status(404).json({ success: false, message: 'Account not found.' });
     }
     const messageId = randomUUID();
-    db().prepare(`INSERT INTO social_messages
+    await (db().prepare(`INSERT INTO social_messages
       (message_id, sender_id, recipient_id, body, type, caption, reply_to_message_id)
       VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .run(messageId, sender, recipient, body, type, type === 'image' ? caption : null, replyToMessageId);
+      .run(messageId, sender, recipient, body, type, type === 'image' ? caption : null, replyToMessageId));
     if (type === 'text' || type === 'image' || type === 'voice' || type === 'call-offer') {
       const notification = type === 'voice'
         ? 'You received a voice message.'
@@ -1416,26 +1453,26 @@ export const sendMessage = (req, res, next) => {
         : type === 'call-offer'
           ? 'You received an incoming call.'
           : 'You received a new message.';
-      notify(recipient, sender, 'message', notification, '/friends');
+      await (notify(recipient, sender, 'message', notification, '/friends'));
     }
     json(res, { messageId }, 201);
   } catch (error) { next(error); }
 };
 
-export const updateMessage = (req, res, next) => {
+export const updateMessage = async (req, res, next) => {
   try {
     const messageId = String(req.params.messageId || '');
     const sender = currentId(req);
     const body = typeof req.body?.body === 'string' ? req.body.body.trim() : '';
     const caption = typeof req.body?.caption === 'string' ? req.body.caption.trim() : '';
-    const message = db().prepare(`
+    const message = await (db().prepare(`
       SELECT message_id, type, body, caption, created_at, deleted_at
       FROM social_messages WHERE message_id = ? AND sender_id = ?
-    `).get(messageId, sender);
+    `).get(messageId, sender));
     if (!message || message.deleted_at) {
       return res.status(404).json({ success: false, message: 'Message not found.' });
     }
-    const ageDays = db().prepare(`SELECT julianday('now') - julianday(?) AS ageDays`).get(message.created_at).ageDays;
+    const ageDays = await (db().prepare(`SELECT EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - ?::timestamptz)) / 86400.0 AS ageDays`).get(message.created_at)).ageDays;
     if (ageDays < 0 || ageDays > 15) {
       return res.status(403).json({ success: false, message: 'Messages can only be edited within 15 days of sending.' });
     }
@@ -1448,25 +1485,25 @@ export const updateMessage = (req, res, next) => {
     if (!['text', 'image'].includes(message.type)) {
       return res.status(400).json({ success: false, message: 'Only text and image captions can be edited.' });
     }
-    db().prepare('UPDATE social_messages SET body = ?, caption = ?, edited_at = CURRENT_TIMESTAMP WHERE message_id = ?')
-      .run(message.type === 'text' ? body : message.body, message.type === 'image' ? caption : null, messageId);
+    await (db().prepare('UPDATE social_messages SET body = ?, caption = ?, edited_at = CURRENT_TIMESTAMP::text WHERE message_id = ?')
+      .run(message.type === 'text' ? body : message.body, message.type === 'image' ? caption : null, messageId));
     json(res, { updated: true });
   } catch (error) { next(error); }
 };
 
-export const deleteMessage = (req, res, next) => {
+export const deleteMessage = async (req, res, next) => {
   try {
     const messageId = String(req.params.messageId || '');
-    const result = db().prepare(`
-      UPDATE social_messages SET deleted_at = CURRENT_TIMESTAMP, body = '', caption = NULL
+    const result = await (db().prepare(`
+      UPDATE social_messages SET deleted_at = CURRENT_TIMESTAMP::text, body = '', caption = NULL
       WHERE message_id = ? AND sender_id = ? AND deleted_at IS NULL AND type != 'coin-gift'
-    `).run(messageId, currentId(req));
+    `).run(messageId, currentId(req)));
     if (!result.changes) return res.status(404).json({ success: false, message: 'Message not found.' });
     json(res, { deleted: true });
   } catch (error) { next(error); }
 };
 
-export const forwardMessage = (req, res, next) => {
+export const forwardMessage = async (req, res, next) => {
   try {
     const sender = currentId(req);
     const recipient = String(req.body?.recipientId || '');
@@ -1474,80 +1511,80 @@ export const forwardMessage = (req, res, next) => {
     if (!recipient || recipient === sender) {
       return res.status(400).json({ success: false, message: 'Choose another account to receive the forwarded message.' });
     }
-    const source = db().prepare(`
+    const source = await (db().prepare(`
       SELECT message_id, body, type, caption, deleted_at FROM social_messages
       WHERE message_id = ? AND (sender_id = ? OR recipient_id = ?)
-    `).get(sourceId, sender, sender);
+    `).get(sourceId, sender, sender));
     if (!source || source.deleted_at || !['text', 'image', 'voice'].includes(source.type)) {
       return res.status(404).json({ success: false, message: 'That message cannot be forwarded.' });
     }
-    const allowed = isRoot(req.user) || db().prepare(`
+    const allowed = isRoot(req.user) || await (db().prepare(`
       SELECT 1 FROM social_follows WHERE (follower_id = ? AND followed_id = ?) OR (follower_id = ? AND followed_id = ?)
-    `).get(sender, recipient, recipient, sender) || db().prepare(`
+    `).get(sender, recipient, recipient, sender)) || await (db().prepare(`
       SELECT 1 FROM social_messages
       WHERE (sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?)
-    `).get(sender, recipient, recipient, sender);
+    `).get(sender, recipient, recipient, sender));
     if (!allowed) return res.status(403).json({ success: false, message: 'Follow this account before messaging.' });
     const messageId = randomUUID();
-    db().prepare(`INSERT INTO social_messages
+    await (db().prepare(`INSERT INTO social_messages
       (message_id, sender_id, recipient_id, body, type, caption, forwarded_from_message_id)
       VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .run(messageId, sender, recipient, source.body, source.type, source.caption, source.message_id);
-    notify(recipient, sender, 'message', 'You received a forwarded message.', '/friends');
+      .run(messageId, sender, recipient, source.body, source.type, source.caption, source.message_id));
+    await (notify(recipient, sender, 'message', 'You received a forwarded message.', '/friends'));
     json(res, { messageId }, 201);
   } catch (error) { next(error); }
 };
 
-export const updatePresence = (req, res, next) => {
+export const updatePresence = async (req, res, next) => {
   try {
-    db().prepare(`
-      INSERT INTO social_presence (user_id, last_seen) VALUES (?, CURRENT_TIMESTAMP)
-      ON CONFLICT(user_id) DO UPDATE SET last_seen = CURRENT_TIMESTAMP
-    `).run(currentId(req));
+    await (db().prepare(`
+      INSERT INTO social_presence (user_id, last_seen) VALUES (?, CURRENT_TIMESTAMP::text)
+      ON CONFLICT(user_id) DO UPDATE SET last_seen = CURRENT_TIMESTAMP::text
+    `).run(currentId(req)));
     json(res, { online: true });
   } catch (error) { next(error); }
 };
 
-export const getSupportPresence = (req, res, next) => {
+export const getSupportPresence = async (req, res, next) => {
   try {
-    const online = !!db().prepare(`
+    const online = !!await (db().prepare(`
       SELECT 1 FROM social_presence presence
       JOIN users u ON CAST(u._id AS TEXT) = presence.user_id
       WHERE LOWER(u.role) IN ('admin', 'root')
         AND u.is_active = 1
-        AND presence.last_seen >= datetime('now', '-90 seconds')
+        AND presence.last_seen::timestamptz >= NOW() - INTERVAL '90 seconds'
       LIMIT 1
-    `).get();
+    `).get());
     json(res, { online });
   } catch (error) { next(error); }
 };
 
-export const getRootMessageUsers = (req, res, next) => {
+export const getRootMessageUsers = async (req, res, next) => {
   try {
     const query = String(req.query.q || '').trim().slice(0, 80);
     const role = String(req.query.role || '').trim().toLowerCase().slice(0, 40);
-    const users = db().prepare(`
+    const users = await (db().prepare(`
       SELECT CAST(u._id AS TEXT) AS user_id, u.username,
         COALESCE(u.full_name, u.username) AS full_name, u.role,
         EXISTS(SELECT 1 FROM social_presence presence
           WHERE presence.user_id = CAST(u._id AS TEXT)
-            AND presence.last_seen >= datetime('now', '-90 seconds')) AS is_online
+            AND presence.last_seen::timestamptz >= NOW() - INTERVAL '90 seconds') AS is_online
       FROM users u
       WHERE u.is_active = 1
         AND CAST(u._id AS TEXT) <> ?
         AND (? = '' OR u.username LIKE ? OR u.full_name LIKE ? OR u.email LIKE ?)
         AND (? = '' OR LOWER(u.role) LIKE ?)
       ORDER BY u.username LIMIT 100
-    `).all(currentId(req), query, `%${query}%`, `%${query}%`, `%${query}%`, role, `%${role}%`);
+    `).all(currentId(req), query, `%${query}%`, `%${query}%`, `%${query}%`, role, `%${role}%`));
     json(res, users);
   } catch (error) { next(error); }
 };
 
-export const getRootUserThreads = (req, res, next) => {
+export const getRootUserThreads = async (req, res, next) => {
   try {
     const userId = String(req.params.userId || '');
     if (!/^\d+$/.test(userId)) return res.status(400).json({ success: false, message: 'Choose a valid account.' });
-    const threads = db().prepare(`
+    const threads = await (db().prepare(`
       SELECT CAST(other._id AS TEXT) AS user_id, other.username,
         COALESCE(other.full_name, other.username) AS full_name, other.role,
         (SELECT CASE
@@ -1563,7 +1600,7 @@ export const getRootUserThreads = (req, res, next) => {
             OR (latest.sender_id = CAST(other._id AS TEXT) AND latest.recipient_id = ?)) AS updated_at,
         EXISTS(SELECT 1 FROM social_presence presence
           WHERE presence.user_id = CAST(other._id AS TEXT)
-            AND presence.last_seen >= datetime('now', '-90 seconds')) AS is_online
+            AND presence.last_seen::timestamptz >= NOW() - INTERVAL '90 seconds') AS is_online
       FROM users other
       WHERE other.is_active = 1 AND CAST(other._id AS TEXT) <> ?
         AND (
@@ -1575,19 +1612,19 @@ export const getRootUserThreads = (req, res, next) => {
                OR (f.follower_id = CAST(other._id AS TEXT) AND f.followed_id = ?))
         )
       ORDER BY updated_at DESC LIMIT 100
-    `).all(userId, userId, userId, userId, userId, userId, userId, userId, userId);
+    `).all(userId, userId, userId, userId, userId, userId, userId, userId, userId));
     json(res, threads);
   } catch (error) { next(error); }
 };
 
-export const getRootMessageConversation = (req, res, next) => {
+export const getRootMessageConversation = async (req, res, next) => {
   try {
     const userId = String(req.query.userId || '');
     const otherUserId = String(req.query.otherUserId || '');
     if (!/^\d+$/.test(userId) || !/^\d+$/.test(otherUserId) || userId === otherUserId) {
       return res.status(400).json({ success: false, message: 'Choose two valid accounts.' });
     }
-    const messages = db().prepare(`
+    const messages = await (db().prepare(`
       SELECT m.message_id, m.sender_id, m.recipient_id, m.body, m.type, m.created_at, m.read_at,
         COALESCE(sender.username, 'Member') AS sender_name
       FROM social_messages m
@@ -1595,12 +1632,12 @@ export const getRootMessageConversation = (req, res, next) => {
       WHERE (m.sender_id = ? AND m.recipient_id = ?)
          OR (m.sender_id = ? AND m.recipient_id = ?)
       ORDER BY m.created_at ASC LIMIT 200
-    `).all(userId, otherUserId, otherUserId, userId);
+    `).all(userId, otherUserId, otherUserId, userId));
     json(res, messages);
   } catch (error) { next(error); }
 };
 
-export const sendRootMessage = (req, res, next) => {
+export const sendRootMessage = async (req, res, next) => {
   try {
     const sender = currentId(req);
     const recipient = String(req.body?.recipientId || '');
@@ -1608,20 +1645,20 @@ export const sendRootMessage = (req, res, next) => {
     if (!/^\d+$/.test(recipient) || recipient === sender || !validText(body, 2000)) {
       return res.status(400).json({ success: false, message: 'Enter a recipient and message (up to 2,000 characters).' });
     }
-    const user = db().prepare('SELECT 1 FROM users WHERE _id = ? AND is_active = 1').get(Number(recipient));
+    const user = await (db().prepare('SELECT 1 FROM users WHERE _id = ? AND is_active = 1').get(Number(recipient)));
     if (!user) return res.status(404).json({ success: false, message: 'Account not found.' });
     const messageId = randomUUID();
-    db().prepare('INSERT INTO social_messages (message_id, sender_id, recipient_id, body) VALUES (?, ?, ?, ?)')
-      .run(messageId, sender, recipient, body);
-    notify(recipient, sender, 'message', 'You received a new message from support.', '/friends');
+    await (db().prepare('INSERT INTO social_messages (message_id, sender_id, recipient_id, body) VALUES (?, ?, ?, ?)')
+      .run(messageId, sender, recipient, body));
+    await (notify(recipient, sender, 'message', 'You received a new message from support.', '/friends'));
     json(res, { messageId }, 201);
   } catch (error) { next(error); }
 };
 
-export const getInbox = (req, res, next) => {
+export const getInbox = async (req, res, next) => {
   try {
     const userId = currentId(req);
-    const inbox = db().prepare(`
+    const inbox = await (db().prepare(`
       SELECT m.message_id, m.sender_id, m.recipient_id,
         CASE WHEN m.deleted_at IS NOT NULL THEN 'This message was deleted.'
              WHEN m.type = 'voice' THEN 'Voice message'
@@ -1633,79 +1670,79 @@ export const getInbox = (req, res, next) => {
         COALESCE(u.username, 'Member') AS sender_name
       FROM social_messages m LEFT JOIN users u ON CAST(u._id AS TEXT) = m.sender_id
       WHERE m.recipient_id = ? ORDER BY m.created_at DESC LIMIT 100
-    `).all(userId);
+    `).all(userId));
     json(res, inbox);
   } catch (error) { next(error); }
 };
 
-export const getSocialUnreadCounts = (req, res, next) => {
+export const getSocialUnreadCounts = async (req, res, next) => {
   try {
     const userId = currentId(req);
-    const unreadMessages = db().prepare(
+    const unreadMessages = await (db().prepare(
       'SELECT COUNT(*) AS count FROM social_messages WHERE recipient_id = ? AND read_at IS NULL'
-    ).get(userId).count;
-    const unreadNotifications = db().prepare(
+    ).get(userId)).count;
+    const unreadNotifications = await (db().prepare(
       'SELECT COUNT(*) AS count FROM social_notifications WHERE user_id = ? AND read_at IS NULL'
-    ).get(userId).count;
+    ).get(userId)).count;
     json(res, { messages: Number(unreadMessages), notifications: Number(unreadNotifications) });
   } catch (error) { next(error); }
 };
 
-export const getNotifications = (req, res, next) => {
+export const getNotifications = async (req, res, next) => {
   try {
     const userId = currentId(req);
-    const notifications = db().prepare(`
+    const notifications = await (db().prepare(`
       SELECT n.notification_id, n.actor_id, n.type, n.message, n.link, n.created_at, n.read_at,
         COALESCE(u.username, 'REDSEA') AS actor_name
       FROM social_notifications n LEFT JOIN users u ON CAST(u._id AS TEXT) = n.actor_id
       WHERE n.user_id = ? ORDER BY n.created_at DESC LIMIT 100
-    `).all(userId);
+    `).all(userId));
     json(res, notifications);
   } catch (error) { next(error); }
 };
 
-export const markNotificationsRead = (req, res, next) => {
+export const markNotificationsRead = async (req, res, next) => {
   try {
-    db().prepare('UPDATE social_notifications SET read_at = CURRENT_TIMESTAMP WHERE user_id = ? AND read_at IS NULL').run(currentId(req));
+    await (db().prepare('UPDATE social_notifications SET read_at = CURRENT_TIMESTAMP::text WHERE user_id = ? AND read_at IS NULL').run(currentId(req)));
     json(res, { read: true });
   } catch (error) { next(error); }
 };
 
-export const getWallet = (req, res, next) => {
+export const getWallet = async (req, res, next) => {
   try {
     const userId = currentId(req);
-    const user = db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId));
-    const rates = roleRates(user?.role);
-    awardDailyLoginCoins(userId);
-    settleMaturedCoinSavings(userId);
-    const rows = db().prepare('SELECT * FROM wallet_ledger WHERE user_id = ? ORDER BY created_at DESC LIMIT 100').all(userId);
-    const balances = db().prepare(`
+    const user = await (db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId)));
+    const rates = await (roleRates(user?.role));
+    await (awardDailyLoginCoins(userId));
+    await settleMaturedCoinSavings(userId);
+    const rows = await (db().prepare('SELECT * FROM wallet_ledger WHERE user_id = ? ORDER BY created_at DESC LIMIT 100').all(userId));
+    const balances = await (db().prepare(`
       SELECT
         COALESCE(SUM(CASE WHEN balance_type = 'real' THEN amount ELSE 0 END), 0) AS realBalance,
         COALESCE(SUM(CASE WHEN balance_type = 'bonus' THEN amount ELSE 0 END), 0) AS bonusBalance
       FROM wallet_ledger WHERE user_id = ?
-    `).get(userId);
-    const coinRows = db().prepare('SELECT * FROM wallet_coin_ledger WHERE user_id = ? ORDER BY created_at DESC LIMIT 100').all(userId);
-    const withdrawals = db().prepare(`
+    `).get(userId));
+    const coinRows = await (db().prepare('SELECT * FROM wallet_coin_ledger WHERE user_id = ? ORDER BY created_at DESC LIMIT 100').all(userId));
+    const withdrawals = await (db().prepare(`
       SELECT withdrawal_id, user_id, amount, payout_details, balance_type,
              transaction_reference, status, created_at, updated_at,
              CASE WHEN receipt_file IS NULL OR receipt_file = '' THEN 0 ELSE 1 END AS receipt_available
       FROM wallet_withdrawals WHERE user_id = ? ORDER BY created_at DESC LIMIT 30
-    `).all(userId);
-    const pendingWithdrawals = db().prepare("SELECT COALESCE(SUM(amount), 0) AS amount FROM wallet_withdrawals WHERE user_id = ? AND balance_type = 'real' AND status IN ('pending', 'approved')").get(userId).amount;
-    const pendingAgentWithdrawals = db().prepare("SELECT COALESCE(SUM(amount), 0) AS amount FROM agent_wallet_requests WHERE user_id = ? AND request_type = 'withdrawal' AND status = 'pending'").get(userId).amount;
-    const pendingBonusWithdrawals = db().prepare("SELECT COALESCE(SUM(amount), 0) AS amount FROM wallet_withdrawals WHERE user_id = ? AND balance_type = 'bonus' AND status IN ('pending', 'approved')").get(userId).amount;
-    const deposits = db().prepare('SELECT * FROM wallet_deposits WHERE user_id = ? ORDER BY created_at DESC LIMIT 30').all(userId);
-    const coinSavings = db().prepare(`
+    `).all(userId));
+    const pendingWithdrawals = await (db().prepare("SELECT COALESCE(SUM(amount), 0) AS amount FROM wallet_withdrawals WHERE user_id = ? AND balance_type = 'real' AND status IN ('pending', 'approved')").get(userId)).amount;
+    const pendingAgentWithdrawals = await (db().prepare("SELECT COALESCE(SUM(amount), 0) AS amount FROM agent_wallet_requests WHERE user_id = ? AND request_type = 'withdrawal' AND status = 'pending'").get(userId)).amount;
+    const pendingBonusWithdrawals = await (db().prepare("SELECT COALESCE(SUM(amount), 0) AS amount FROM wallet_withdrawals WHERE user_id = ? AND balance_type = 'bonus' AND status IN ('pending', 'approved')").get(userId)).amount;
+    const deposits = await (db().prepare('SELECT * FROM wallet_deposits WHERE user_id = ? ORDER BY created_at DESC LIMIT 30').all(userId));
+    const coinSavings = await (db().prepare(`
       SELECT deposit_id, principal, daily_rate_percent, duration_days, expected_interest,
         maturity_at, status, created_at, settled_at
       FROM wallet_coin_savings WHERE user_id = ? ORDER BY created_at DESC LIMIT 100
-    `).all(userId);
+    `).all(userId));
     json(res, {
       balance: balances.realBalance + balances.bonusBalance,
       realBalance: balances.realBalance,
       bonusBalance: balances.bonusBalance,
-      coinBalance: coinBalance(userId),
+      coinBalance: await (coinBalance(userId)),
       availableBalance: Math.max(0, balances.realBalance - pendingWithdrawals - pendingAgentWithdrawals),
       availableBonusBalance: Math.max(0, balances.bonusBalance - pendingBonusWithdrawals),
       currency: rates.currency,
@@ -1715,17 +1752,17 @@ export const getWallet = (req, res, next) => {
       withdrawals,
       deposits,
       coinSavings,
-      referralCode: ensureReferralCode(userId)
+      referralCode: await (ensureReferralCode(userId))
     });
   } catch (error) { next(error); }
 };
 
-export const createCoinSavings = (req, res, next) => {
+export const createCoinSavings = async (req, res, next) => {
   try {
     const userId = currentId(req);
-    const user = db().prepare('SELECT role FROM users WHERE CAST(_id AS TEXT) = ?').get(userId);
+    const user = await (db().prepare('SELECT role FROM users WHERE CAST(_id AS TEXT) = ?').get(userId));
     if (!user) return res.status(404).json({ success: false, message: 'Account not found.' });
-    const rates = roleRates(user.role);
+    const rates = await (roleRates(user.role));
     const amount = Number(req.body?.amount);
     const durationDays = Number(req.body?.durationDays);
     const allowedDurations = new Set([1, 7, 30, 90, 180, 365]);
@@ -1744,31 +1781,31 @@ export const createCoinSavings = (req, res, next) => {
       return res.status(400).json({ success: false, message: 'The requested deposit and interest exceed the supported coin balance.' });
     }
     const maturityAt = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000).toISOString();
-    const create = db().transaction(() => {
-      if (coinBalance(userId) < amount) return false;
-      if (!creditCoins(
+    const create = db().transaction(async () => {
+      if (await (coinBalance(userId)) < amount) return false;
+      if (!await creditCoins(
         userId,
         -amount,
         'coin_savings_deposit',
         `coin-savings:${depositId}:principal-lock`,
         `Locked ${amount} coins for ${durationDays} days`
       )) throw new Error('Could not lock coins for this savings deposit.');
-      db().prepare(`
+      await (db().prepare(`
         INSERT INTO wallet_coin_savings (
           deposit_id, user_id, principal, daily_rate_percent, duration_days, expected_interest, maturity_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(depositId, userId, amount, dailyRate, durationDays, expectedInterest, maturityAt);
+      `).run(depositId, userId, amount, dailyRate, durationDays, expectedInterest, maturityAt));
       return true;
     });
     if (!create()) return res.status(409).json({ success: false, message: 'Your available coin balance is too low for this deposit.' });
-    json(res, db().prepare('SELECT * FROM wallet_coin_savings WHERE deposit_id = ?').get(depositId), 201);
+    json(res, await (db().prepare('SELECT * FROM wallet_coin_savings WHERE deposit_id = ?').get(depositId)), 201);
   } catch (error) { next(error); }
 };
 
-export const getMyWalletActivity = (req, res, next) => {
+export const getMyWalletActivity = async (req, res, next) => {
   try {
     const userId = currentId(req);
-    awardDailyLoginCoins(userId);
+    await (awardDailyLoginCoins(userId));
     const asset = String(req.query?.asset || 'all');
     const search = String(req.query?.search || '').trim();
     const page = Number.parseInt(req.query?.page, 10) || 1;
@@ -1802,9 +1839,9 @@ export const getMyWalletActivity = (req, res, next) => {
       )
     `;
     const allParams = [userId, userId, ...params];
-    const total = db().prepare(`${activity} SELECT COUNT(*) AS total FROM activity ${where}`)
-      .get(...allParams).total;
-    const summary = db().prepare(`
+    const total = await (db().prepare(`${activity} SELECT COUNT(*) AS total FROM activity ${where}`)
+      .get(...allParams)).total;
+    const summary = await (db().prepare(`
       ${activity}
       SELECT COUNT(*) AS transaction_count,
         COALESCE(SUM(CASE WHEN asset = 'coin' AND amount > 0 THEN amount ELSE 0 END), 0) AS coins_earned,
@@ -1814,38 +1851,39 @@ export const getMyWalletActivity = (req, res, next) => {
         COALESCE(SUM(CASE WHEN asset = 'ETB' AND bucket = 'bonus' AND amount > 0 THEN amount ELSE 0 END), 0) AS bonus_earned,
         COALESCE(SUM(CASE WHEN asset = 'ETB' AND bucket = 'real' AND amount > 0 THEN amount ELSE 0 END), 0) AS real_credited
       FROM activity ${where}
-    `).get(...allParams);
-    const entries = db().prepare(`
+    `).get(...allParams));
+    const entries = await (db().prepare(`
       ${activity}
       SELECT * FROM activity ${where}
       ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
-    `).all(...allParams, pageSize, (page - 1) * pageSize);
+    `).all(...allParams, pageSize, (page - 1) * pageSize));
     json(res, { entries, total, page, pageSize, summary });
   } catch (error) { next(error); }
 };
 
-export const createDeposit = (req, res, next) => {
+export const createDeposit = async (req, res, next) => {
   try {
     const userId = currentId(req);
     const amount = Math.round(Number(req.body?.amount) * 100) / 100;
     const paymentMethod = String(req.body?.paymentMethod || '').trim();
     const paymentReference = String(req.body?.paymentReference || '').trim();
-    const role = db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId))?.role;
-    const settings = roleRates(role);
+    const user = await db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId));
+    const role = user?.role;
+    const settings = await (roleRates(role));
     if (!Number.isFinite(amount) || amount < settings.min_deposit || amount > settings.max_deposit ||
         !validText(paymentMethod, 80) || !validText(paymentReference, 250)) {
       return res.status(400).json({ success: false, message: `Enter a deposit between ${settings.min_deposit} and ${settings.max_deposit} ${settings.currency}, with a payment method and transaction reference.` });
     }
     const depositId = randomUUID();
-    db().prepare(`
+    await (db().prepare(`
       INSERT INTO wallet_deposits (deposit_id, user_id, amount, payment_method, payment_reference)
       VALUES (?, ?, ?, ?, ?)
-    `).run(depositId, userId, amount, paymentMethod, paymentReference);
+    `).run(depositId, userId, amount, paymentMethod, paymentReference));
     json(res, { depositId, amount, status: 'pending' }, 201);
   } catch (error) { next(error); }
 };
 
-export const createWithdrawal = (req, res, next) => {
+export const createWithdrawal = async (req, res, next) => {
   try {
     const userId = currentId(req);
     const amount = Math.round(Number(req.body?.amount) * 100) / 100;
@@ -1853,8 +1891,9 @@ export const createWithdrawal = (req, res, next) => {
     const transactionReference = String(req.body?.transactionReference || '').trim();
     const receiptFile = String(req.body?.receiptFile || '');
     const balanceType = String(req.body?.balanceType || 'real');
-    const role = db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId))?.role;
-    const settings = roleRates(role);
+    const user = await db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId));
+    const role = user?.role;
+    const settings = await (roleRates(role));
     const minimum = balanceType === 'bonus' ? settings.min_bonus_withdrawal : settings.min_withdrawal;
     const maximum = balanceType === 'bonus' ? settings.max_bonus_withdrawal : settings.max_withdrawal;
     const withdrawalId = randomUUID();
@@ -1866,22 +1905,22 @@ export const createWithdrawal = (req, res, next) => {
       || receiptFile.length > 8_000_000)) {
       return res.status(400).json({ success: false, message: 'Receipt must be a PNG, JPEG, WebP, or PDF file no larger than 6 MB.' });
     }
-    const create = db().transaction(() => {
-      const available = db().prepare(`
+    const create = db().transaction(async () => {
+      const available = await (db().prepare(`
         SELECT COALESCE(SUM(l.amount), 0) -
           COALESCE((SELECT SUM(w.amount) FROM wallet_withdrawals w
             WHERE w.user_id = ? AND w.balance_type = ? AND w.status IN ('pending', 'approved')), 0) -
           COALESCE((SELECT SUM(r.amount) FROM agent_wallet_requests r
             WHERE r.user_id = ? AND r.request_type = 'withdrawal' AND r.status = 'pending' AND ? = 'real'), 0) AS available
         FROM wallet_ledger l WHERE l.user_id = ? AND l.balance_type = ?
-      `).get(userId, balanceType, userId, balanceType, userId, balanceType).available;
+      `).get(userId, balanceType, userId, balanceType, userId, balanceType)).available;
       if (amount > available) throw new Error(`Withdrawal amount exceeds your available ${balanceType} balance.`);
-      db().prepare(`INSERT INTO wallet_withdrawals
+      await (db().prepare(`INSERT INTO wallet_withdrawals
         (withdrawal_id, user_id, amount, payout_details, balance_type, transaction_reference, receipt_file)
         VALUES (?, ?, ?, ?, ?, ?, ?)`)
-        .run(withdrawalId, userId, amount, payoutDetails, balanceType, transactionReference, receiptFile || null);
+        .run(withdrawalId, userId, amount, payoutDetails, balanceType, transactionReference, receiptFile || null));
     });
-    create();
+    await create();
     json(res, { withdrawalId, amount, balanceType, status: 'pending' }, 201);
   } catch (error) {
     if (error.message.startsWith('Withdrawal amount exceeds your available ')) {
@@ -1891,50 +1930,53 @@ export const createWithdrawal = (req, res, next) => {
   }
 };
 
-export const sendCoinGift = (req, res, next) => {
+export const sendCoinGift = async (req, res, next) => {
   try {
     const senderId = currentId(req);
     const recipientUsername = String(req.body?.recipientUsername || '').trim();
     const amount = Number(req.body?.amount);
-    const recipient = db().prepare('SELECT CAST(_id AS TEXT) AS user_id, username FROM users WHERE lower(username) = lower(?)').get(recipientUsername);
+    const recipient = await (db().prepare('SELECT CAST(_id AS TEXT) AS user_id, username FROM users WHERE lower(username) = lower(?)').get(recipientUsername));
     if (!recipient || String(recipient.user_id) === senderId) {
       return res.status(400).json({ success: false, message: 'Choose a different, existing friend by username.' });
     }
     if (!Number.isSafeInteger(amount) || amount <= 0) {
       return res.status(400).json({ success: false, message: 'Enter a positive whole-number coin gift.' });
     }
-    if (!hasFollowConnection(senderId, recipient.user_id)) {
+    if (!await (hasFollowConnection(senderId, recipient.user_id))) {
       return res.status(403).json({ success: false, message: 'Follow this account or have them follow you before sending a coin gift.' });
     }
-    const role = db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(recipient.user_id))?.role;
-    const rewardSettings = roleRates(role);
+    const recipientAccount = await db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(recipient.user_id));
+    const role = recipientAccount?.role;
+    const rewardSettings = await (roleRates(role));
     const giftBonus = Math.floor(amount * Number(rewardSettings.coin_gift_bonus_percent) / 100);
     const receiveReward = Number(rewardSettings.coin_gift_receive_reward);
     const giftReference = randomUUID();
     const giftMessageId = randomUUID();
-    const sendGift = db().transaction(() => {
-      if (coinBalance(senderId) < amount) throw new Error('Not enough coins for this gift.');
-      creditCoins(senderId, -amount, 'coin_gift_sent', `gift-sent:${giftReference}`, `Gift sent to @${recipient.username}`);
-      creditCoins(recipient.user_id, amount, 'coin_gift_received', `gift-received:${giftReference}`, `Gift received from @${req.user.username || 'friend'}`);
-      creditCoins(recipient.user_id, giftBonus, 'coin_gift_bonus', `gift-bonus:${giftReference}`, 'Gift percentage bonus');
-      creditCoins(recipient.user_id, receiveReward, 'coin_gift_receive_reward', `gift-reward:${giftReference}`, 'Platform coin reward for receiving a gift');
-      db().prepare(`
+    const sendGift = db().transaction(async () => {
+      if (await (coinBalance(senderId)) < amount) throw new Error('Not enough coins for this gift.');
+      if (!await creditCoins(senderId, -amount, 'coin_gift_sent', `gift-sent:${giftReference}`, `Gift sent to @${recipient.username}`)) {
+        throw new Error('Could not debit coins for this gift.');
+      }
+      await creditCoins(recipient.user_id, amount, 'coin_gift_received', `gift-received:${giftReference}`, `Gift received from @${req.user.username || 'friend'}`);
+      await creditCoins(recipient.user_id, giftBonus, 'coin_gift_bonus', `gift-bonus:${giftReference}`, 'Gift percentage bonus');
+      await creditCoins(recipient.user_id, receiveReward, 'coin_gift_receive_reward', `gift-reward:${giftReference}`, 'Platform coin reward for receiving a gift');
+      await (db().prepare(`
         INSERT INTO social_messages (message_id, sender_id, recipient_id, body, type)
         VALUES (?, ?, ?, ?, 'coin-gift')
       `).run(giftMessageId, senderId, recipient.user_id, JSON.stringify({
         amount,
         giftBonus: giftBonus + receiveReward,
-      }));
-      notify(recipient.user_id, senderId, 'coin_gift', `🎁 You received ${amount} coins from @${req.user.username || 'a friend'}${giftBonus || receiveReward ? `, plus ${giftBonus + receiveReward} bonus coins` : ''}!`, '/wallet');
-      notify(senderId, recipient.user_id, 'coin_gift_sent', `🎁 Your ${amount}-coin gift was sent to @${recipient.username}.`, '/wallet');
+      })));
+      await (notify(recipient.user_id, senderId, 'coin_gift', `🎁 You received ${amount} coins from @${req.user.username || 'a friend'}${giftBonus || receiveReward ? `, plus ${giftBonus + receiveReward} bonus coins` : ''}!`, '/wallet'));
+      await (notify(senderId, recipient.user_id, 'coin_gift_sent', `🎁 Your ${amount}-coin gift was sent to @${recipient.username}.`, '/wallet'));
     });
-    sendGift();
+    await sendGift();
     json(res, {
       giftMessageId,
       recipient: recipient.username,
       amount,
       giftBonus: giftBonus + receiveReward,
-      senderCoinBalance: coinBalance(senderId),
+      senderCoinBalance: await (coinBalance(senderId)),
     });
   } catch (error) {
     if (error.message === 'Not enough coins for this gift.') {
@@ -1944,25 +1986,28 @@ export const sendCoinGift = (req, res, next) => {
   }
 };
 
-export const convertCoinsToEtb = (req, res, next) => {
+export const convertCoinsToEtb = async (req, res, next) => {
   try {
     const userId = currentId(req);
     const amount = Number(req.body?.amount);
-    const userRole = db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId))?.role;
-    const settings = roleRates(userRole);
+    const user = await db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId));
+    const userRole = user?.role;
+    const settings = await (roleRates(userRole));
     if (!Number.isSafeInteger(amount) || amount < settings.min_coin_conversion || amount > settings.max_coin_conversion) {
       return res.status(400).json({ success: false, message: `Enter a whole coin amount between ${settings.min_coin_conversion} and ${settings.max_coin_conversion}.` });
     }
     const etb = Math.round((amount / settings.coin_per_etb) * 100) / 100;
     if (etb <= 0) return res.status(400).json({ success: false, message: 'This coin amount is below the smallest convertible ETB amount.' });
     const reference = randomUUID();
-    const convert = db().transaction(() => {
-      if (coinBalance(userId) < amount) throw new Error('Not enough coins for this conversion.');
-      creditCoins(userId, -amount, 'coin_conversion', `coin-convert:${reference}`, `Converted ${amount} coins to ${etb.toFixed(2)} ${settings.currency}`);
-      creditWallet(userId, etb, 'coin_conversion', `etb-convert:${reference}`, `Converted ${amount} coins to ETB`);
-      notify(userId, null, 'coin_conversion', `Converted ${amount} coins to ${etb.toFixed(2)} ${settings.currency}.`, '/wallet');
+    const convert = db().transaction(async () => {
+      if (await (coinBalance(userId)) < amount) throw new Error('Not enough coins for this conversion.');
+      if (!await creditCoins(userId, -amount, 'coin_conversion', `coin-convert:${reference}`, `Converted ${amount} coins to ${etb.toFixed(2)} ${settings.currency}`)) {
+        throw new Error('Could not debit coins for this conversion.');
+      }
+      await (creditWallet(userId, etb, 'coin_conversion', `etb-convert:${reference}`, `Converted ${amount} coins to ETB`));
+      await (notify(userId, null, 'coin_conversion', `Converted ${amount} coins to ${etb.toFixed(2)} ${settings.currency}.`, '/wallet'));
     });
-    convert();
+    await convert();
     json(res, { coins: amount, amount: etb, currency: settings.currency });
   } catch (error) {
     if (error.message === 'Not enough coins for this conversion.') {
@@ -1972,32 +2017,35 @@ export const convertCoinsToEtb = (req, res, next) => {
   }
 };
 
-export const convertEtbToCoins = (req, res, next) => {
+export const convertEtbToCoins = async (req, res, next) => {
   try {
     const userId = currentId(req);
     const amount = Math.round(Number(req.body?.amount) * 100) / 100;
-    const userRole = db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId))?.role;
-    const settings = roleRates(userRole);
+    const user = await db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId));
+    const userRole = user?.role;
+    const settings = await (roleRates(userRole));
     const coins = Math.round(amount * settings.coin_per_etb);
     if (!Number.isFinite(amount) || amount <= 0 || !Number.isSafeInteger(coins) ||
         coins < settings.min_coin_conversion || coins > settings.max_coin_conversion) {
       return res.status(400).json({ success: false, message: `Enter an ETB amount that converts to between ${settings.min_coin_conversion} and ${settings.max_coin_conversion} coins.` });
     }
     const reference = randomUUID();
-    const convert = db().transaction(() => {
-      const available = db().prepare(`
+    const convert = db().transaction(async () => {
+      const available = await (db().prepare(`
         SELECT COALESCE(SUM(amount), 0) -
           COALESCE((SELECT SUM(amount) FROM wallet_withdrawals WHERE user_id = ? AND balance_type = 'real' AND status IN ('pending', 'approved')), 0) -
           COALESCE((SELECT SUM(amount) FROM agent_wallet_requests
             WHERE user_id = ? AND request_type = 'withdrawal' AND status = 'pending'), 0) AS balance
         FROM wallet_ledger WHERE user_id = ? AND balance_type = 'real'
-      `).get(userId, userId, userId).balance;
+      `).get(userId, userId, userId)).balance;
       if (available < amount) throw new Error('Not enough real ETB balance to buy coins.');
-      creditWallet(userId, -amount, 'etb_to_coin', `coin-purchase:${reference}`, `Exchanged ${amount.toFixed(2)} ETB for ${coins} coins`);
-      creditCoins(userId, coins, 'coin_purchase', `coin-purchase:${reference}`, `Bought ${coins} coins with ETB`);
-      notify(userId, null, 'coin_purchase', `Bought ${coins} coins for ${amount.toFixed(2)} ${settings.currency}.`, '/wallet');
+      await (creditWallet(userId, -amount, 'etb_to_coin', `coin-purchase:${reference}`, `Exchanged ${amount.toFixed(2)} ETB for ${coins} coins`));
+      if (!await creditCoins(userId, coins, 'coin_purchase', `coin-purchase:${reference}`, `Bought ${coins} coins with ETB`)) {
+        throw new Error('Could not credit coins for this purchase.');
+      }
+      await (notify(userId, null, 'coin_purchase', `Bought ${coins} coins for ${amount.toFixed(2)} ${settings.currency}.`, '/wallet'));
     });
-    convert();
+    await convert();
     json(res, { amount, coins, currency: settings.currency });
   } catch (error) {
     if (error.message === 'Not enough real ETB balance to buy coins.') {
@@ -2007,12 +2055,13 @@ export const convertEtbToCoins = (req, res, next) => {
   }
 };
 
-export const convertBonusToReal = (req, res, next) => {
+export const convertBonusToReal = async (req, res, next) => {
   try {
     const userId = currentId(req);
     const amount = Math.round(Number(req.body?.amount) * 100) / 100;
-    const userRole = db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId))?.role;
-    const settings = roleRates(userRole);
+    const user = await db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId));
+    const userRole = user?.role;
+    const settings = await (roleRates(userRole));
     const rate = Number(settings.bonus_to_real_rate);
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ success: false, message: 'Enter a valid bonus amount to convert.' });
@@ -2025,27 +2074,27 @@ export const convertBonusToReal = (req, res, next) => {
       return res.status(400).json({ success: false, message: 'This bonus amount is too small to convert at the configured rate.' });
     }
     const reference = randomUUID();
-    const convert = db().transaction(() => {
-      const available = db().prepare(`
+    const convert = db().transaction(async () => {
+      const available = await (db().prepare(`
         SELECT COALESCE(SUM(l.amount), 0) -
           COALESCE((SELECT SUM(w.amount) FROM wallet_withdrawals w
             WHERE w.user_id = ? AND w.balance_type = 'bonus' AND w.status IN ('pending', 'approved')), 0) AS available
         FROM wallet_ledger l
         WHERE l.user_id = ? AND l.balance_type = 'bonus'
-      `).get(userId, userId).available;
+      `).get(userId, userId)).available;
       if (amount > available) throw new Error('Not enough available bonus balance for this conversion.');
-      const debited = creditWallet(
+      const debited = await (creditWallet(
         userId, -amount, 'bonus_to_real_conversion', `bonus-to-real:${reference}:bonus`,
         `Converted ${amount.toFixed(2)} ${settings.currency} bonus to real balance at ${rate}`, 'bonus'
-      );
-      const credited = creditWallet(
+      ));
+      const credited = await (creditWallet(
         userId, realAmount, 'bonus_to_real_conversion', `bonus-to-real:${reference}:real`,
         `Received ${realAmount.toFixed(2)} ${settings.currency} from bonus conversion`, 'real'
-      );
+      ));
       if (!debited || !credited) throw new Error('Could not record the bonus conversion.');
-      notify(userId, null, 'bonus_to_real_conversion', `Converted ${amount.toFixed(2)} bonus to ${realAmount.toFixed(2)} real ${settings.currency}.`, '/wallet');
+      await (notify(userId, null, 'bonus_to_real_conversion', `Converted ${amount.toFixed(2)} bonus to ${realAmount.toFixed(2)} real ${settings.currency}.`, '/wallet'));
     });
-    convert();
+    await convert();
     json(res, { bonus: amount, amount: realAmount, rate, currency: settings.currency });
   } catch (error) {
     if (error.message === 'Not enough available bonus balance for this conversion.') {
@@ -2055,10 +2104,10 @@ export const convertBonusToReal = (req, res, next) => {
   }
 };
 
-export const getRootWalletData = (req, res, next) => {
+export const getRootWalletData = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
-    const users = db().prepare(`
+    const users = await (db().prepare(`
       SELECT CAST(u._id AS TEXT) AS user_id, u.username, COALESCE(u.full_name, u.username) AS full_name, u.role,
         COALESCE(SUM(CASE WHEN l.balance_type = 'real' THEN l.amount ELSE 0 END), 0) AS real_balance,
         COALESCE(SUM(CASE WHEN l.balance_type = 'bonus' THEN l.amount ELSE 0 END), 0) AS bonus_balance,
@@ -2067,45 +2116,45 @@ export const getRootWalletData = (req, res, next) => {
       FROM users u LEFT JOIN wallet_ledger l ON l.user_id = CAST(u._id AS TEXT)
       LEFT JOIN wallet_settings ws ON ws.role = lower(u.role)
       GROUP BY u._id ORDER BY u.username LIMIT 500
-    `).all();
-    const withdrawals = db().prepare(`
+    `).all());
+    const withdrawals = await (db().prepare(`
       SELECT w.withdrawal_id, w.user_id, w.amount, w.payout_details, w.balance_type,
         w.transaction_reference, w.status, w.created_at, w.updated_at, u.username,
         CASE WHEN w.receipt_file IS NULL OR w.receipt_file = '' THEN 0 ELSE 1 END AS receipt_available
       FROM wallet_withdrawals w
       LEFT JOIN users u ON CAST(u._id AS TEXT) = w.user_id
       ORDER BY CASE w.status WHEN 'pending' THEN 0 ELSE 1 END, w.created_at DESC LIMIT 200
-    `).all();
-    const deposits = db().prepare(`
+    `).all());
+    const deposits = await (db().prepare(`
       SELECT d.*, u.username FROM wallet_deposits d
       LEFT JOIN users u ON CAST(u._id AS TEXT) = d.user_id
       ORDER BY CASE d.status WHEN 'pending' THEN 0 ELSE 1 END, d.created_at DESC LIMIT 200
-    `).all();
-    const roles = db().prepare('SELECT DISTINCT role FROM users WHERE role IS NOT NULL').all().map(row => row.role);
+    `).all());
+    const roles = await (db().prepare('SELECT DISTINCT role FROM users WHERE role IS NOT NULL').all()).map(row => row.role);
     ['user', 'guest', 'staff', 'admin'].forEach(role => { if (!roles.includes(role)) roles.push(role); });
-    const settings = roles.map(role => roleRates(role));
+    const settings = roles.map(async role => await (roleRates(role)));
     json(res, { users, withdrawals, deposits, settings });
   } catch (error) { next(error); }
 };
 
-export const getRootWithdrawalReceipt = (req, res, next) => {
+export const getRootWithdrawalReceipt = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
-    const receipt = db().prepare(
+    const receipt = await (db().prepare(
       'SELECT receipt_file FROM wallet_withdrawals WHERE withdrawal_id = ?'
-    ).get(String(req.params.withdrawalId));
+    ).get(String(req.params.withdrawalId)));
     if (!receipt?.receipt_file) return res.status(404).json({ success: false, message: 'Receipt not found.' });
     json(res, { receiptFile: receipt.receipt_file });
   } catch (error) { next(error); }
 };
 
-export const getMyCoinLevel = (req, res, next) => {
+export const getMyCoinLevel = async (req, res, next) => {
   try {
     const userId = currentId(req);
-    const user = db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId));
-    const rates = roleRates(user?.role);
+    const user = await (db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(userId)));
+    const rates = await (roleRates(user?.role));
     json(res, {
-      ...getCoinLevelProgress(userId),
+      ...await (getCoinLevelProgress(userId)),
       earningRules: {
         signupBonus: Number(rates.signup_bonus),
         inviteReward: Number(rates.invite_reward),
@@ -2124,14 +2173,14 @@ export const getMyCoinLevel = (req, res, next) => {
   } catch (error) { next(error); }
 };
 
-export const getRootCoinLevelRules = (req, res, next) => {
+export const getRootCoinLevelRules = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
-    json(res, getCoinLevelRules());
+    json(res, await (getCoinLevelRules()));
   } catch (error) { next(error); }
 };
 
-export const saveRootCoinLevelRules = (req, res, next) => {
+export const saveRootCoinLevelRules = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
     const submittedRules = req.body?.rules;
@@ -2157,25 +2206,25 @@ export const saveRootCoinLevelRules = (req, res, next) => {
         message: 'Coin thresholds must be non-negative whole numbers and increase at every level; ETB rewards must be valid amounts with up to two decimal places.',
       });
     }
-    const save = db().transaction(() => {
+    const save = db().transaction(async () => {
       const update = db().prepare(`
         UPDATE wallet_coin_level_rules
-        SET required_coins = ?, reward_etb = ?, updated_at = CURRENT_TIMESTAMP
+        SET required_coins = ?, reward_etb = ?, updated_at = CURRENT_TIMESTAMP::text
         WHERE level = ?
       `);
-      for (const rule of rules) update.run(rule.required_coins, rule.reward_etb, rule.level);
-      const users = db().prepare('SELECT CAST(_id AS TEXT) AS user_id FROM users').all();
-      for (const user of users) awardReachedCoinLevels(user.user_id);
+      for (const rule of rules) await (update.run(rule.required_coins, rule.reward_etb, rule.level));
+      const users = await (db().prepare('SELECT CAST(_id AS TEXT) AS user_id FROM users').all());
+      for (const user of users) await (awardReachedCoinLevels(user.user_id));
     });
-    save();
-    json(res, getCoinLevelRules());
+    await save();
+    json(res, await (getCoinLevelRules()));
   } catch (error) { next(error); }
 };
 
-export const getRootCoinLevelHistory = (req, res, next) => {
+export const getRootCoinLevelHistory = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
-    const history = db().prepare(`
+    const history = await (db().prepare(`
       SELECT h.user_id, COALESCE(u.username, '') AS username,
         COALESCE(u.full_name, u.username, 'Unknown user') AS full_name,
         h.level, h.earned_coins, h.reward_etb, h.created_at
@@ -2183,12 +2232,12 @@ export const getRootCoinLevelHistory = (req, res, next) => {
       LEFT JOIN users u ON CAST(u._id AS TEXT) = h.user_id
       ORDER BY h.created_at DESC, h.level DESC
       LIMIT 500
-    `).all();
+    `).all());
     json(res, history);
   } catch (error) { next(error); }
 };
 
-export const getRootUserActivity = (req, res, next) => {
+export const getRootUserActivity = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
     const requestedPage = req.query?.page === undefined ? 1 : Number(req.query.page);
@@ -2196,23 +2245,23 @@ export const getRootUserActivity = (req, res, next) => {
     if (!Number.isSafeInteger(requestedPage) || requestedPage < 1 || requestedPage > 100000) {
       return res.status(400).json({ success: false, message: 'Choose a valid user activity page.' });
     }
-    const total = db().prepare('SELECT COUNT(*) AS total FROM users').get().total;
+    const total = await (db().prepare('SELECT COUNT(*) AS total FROM users').get()).total;
     const page = Math.min(requestedPage, Math.max(1, Math.ceil(total / pageSize)));
-    const users = db().prepare(`
+    const users = await (db().prepare(`
       SELECT CAST(u._id AS TEXT) AS id, u.username, u.email,
         COALESCE(u.full_name, '') AS full_name, COALESCE(u.role, '') AS role,
         COALESCE(u.is_active, 0) AS is_active, u.last_login,
         COALESCE((SELECT SUM(c.amount) FROM wallet_coin_ledger c
           WHERE c.user_id = CAST(u._id AS TEXT) AND c.amount > 0
             AND c.entry_type NOT IN ('coin_purchase', 'coin_savings_return', 'coin_admin_adjustment')), 0) AS earned_coins,
-        CASE WHEN u.is_active = 1 AND p.last_seen >= datetime('now', '-90 seconds')
+        CASE WHEN u.is_active = 1 AND p.last_seen::timestamptz >= NOW() - INTERVAL '90 seconds'
           THEN 1 ELSE 0 END AS is_online
       FROM users u
       LEFT JOIN social_presence p ON p.user_id = CAST(u._id AS TEXT)
       ORDER BY is_online DESC, COALESCE(u.last_login, u.created_at) DESC, u.username ASC
       LIMIT ? OFFSET ?
-    `).all(pageSize, (page - 1) * pageSize);
-    const levelRules = getCoinLevelRules();
+    `).all(pageSize, (page - 1) * pageSize));
+    const levelRules = await (getCoinLevelRules());
     const usersWithLevels = users.map(user => ({
       ...user,
       current_level: levelRules.filter(rule => user.earned_coins >= rule.required_coins).at(-1)?.level || 0,
@@ -2223,7 +2272,7 @@ export const getRootUserActivity = (req, res, next) => {
   } catch (error) { next(error); }
 };
 
-export const getRootWalletActivity = (req, res, next) => {
+export const getRootWalletActivity = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
     const from = String(req.query?.from || '');
@@ -2243,8 +2292,8 @@ export const getRootWalletActivity = (req, res, next) => {
     }
     const conditions = [];
     const params = [];
-    if (from) { conditions.push('date(created_at) >= ?'); params.push(String(from)); }
-    if (to) { conditions.push('date(created_at) <= ?'); params.push(String(to)); }
+    if (from) { conditions.push('created_at::date >= ?'); params.push(String(from)); }
+    if (to) { conditions.push('created_at::date <= ?'); params.push(String(to)); }
     if (role) { conditions.push('lower(role) = lower(?)'); params.push(String(role)); }
     if (asset === 'real' || asset === 'bonus') {
       conditions.push("asset = 'ETB' AND bucket = ?");
@@ -2271,8 +2320,8 @@ export const getRootWalletActivity = (req, res, next) => {
         FROM wallet_coin_ledger c LEFT JOIN users u ON CAST(u._id AS TEXT) = c.user_id
       )
     `;
-    const count = db().prepare(`${activitySql} SELECT COUNT(*) AS total FROM activity ${where}`).get(...params).total;
-    const summary = db().prepare(`
+    const count = await (db().prepare(`${activitySql} SELECT COUNT(*) AS total FROM activity ${where}`).get(...params)).total;
+    const summary = await (db().prepare(`
       ${activitySql}
       SELECT COUNT(*) AS transaction_count,
         COALESCE(SUM(CASE WHEN asset = 'coin' AND amount > 0 THEN amount ELSE 0 END), 0) AS coins_credited,
@@ -2282,17 +2331,17 @@ export const getRootWalletActivity = (req, res, next) => {
         COALESCE(SUM(CASE WHEN asset = 'ETB' AND bucket = 'real' AND amount > 0 THEN amount ELSE 0 END), 0) AS real_credited,
         COALESCE(SUM(CASE WHEN asset = 'ETB' AND bucket = 'bonus' AND amount > 0 THEN amount ELSE 0 END), 0) AS bonus_credited
       FROM activity ${where}
-    `).get(...params);
-    const entries = db().prepare(`
+    `).get(...params));
+    const entries = await (db().prepare(`
       ${activitySql}
       SELECT * FROM activity ${where}
       ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
-    `).all(...params, pageSize, (page - 1) * pageSize);
+    `).all(...params, pageSize, (page - 1) * pageSize));
     json(res, { entries, total: count, page, pageSize, summary });
   } catch (error) { next(error); }
 };
 
-export const updateRootWalletSettings = (req, res, next) => {
+export const updateRootWalletSettings = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
     const { role } = req.body || {};
@@ -2300,7 +2349,7 @@ export const updateRootWalletSettings = (req, res, next) => {
     if (!/^[A-Za-z][A-Za-z0-9_-]{0,39}$/i.test(normalizedRole)) {
       return res.status(400).json({ success: false, message: 'Choose a valid account role.' });
     }
-    const existing = roleRates(normalizedRole);
+    const existing = await (roleRates(normalizedRole));
     const numberSetting = (field, previous) => req.body?.[field] === undefined ? Number(previous) : Number(req.body[field]);
     const signupBonus = numberSetting('signupBonus', existing.signup_bonus);
     const inviteReward = numberSetting('inviteReward', existing.invite_reward);
@@ -2349,14 +2398,14 @@ export const updateRootWalletSettings = (req, res, next) => {
         !/^[A-Za-z]{3,8}$/.test(normalizedCurrency)) {
       return res.status(400).json({ success: false, message: 'Enter valid reward amounts, coin savings rate and limits, coin conversion limits, real/bonus deposit and withdrawal limits, invitation trigger, and a 3–8 letter currency code.' });
     }
-    const hasLedger = db().prepare(`
+    const hasLedger = await (db().prepare(`
       SELECT 1 FROM users u JOIN wallet_ledger l ON l.user_id = CAST(u._id AS TEXT)
       WHERE lower(u.role) = ? LIMIT 1
-    `).get(normalizedRole);
+    `).get(normalizedRole));
     if (hasLedger && existing.currency !== normalizedCurrency) {
       return res.status(409).json({ success: false, message: 'Currency cannot be changed after this role has wallet activity.' });
     }
-    db().prepare(`
+    await (db().prepare(`
       INSERT INTO wallet_settings (
         role, signup_bonus, invite_reward, share_reward, product_sale_percent, currency, invite_reward_trigger,
         coin_login_reward, coin_share_reward, coin_invite_reward, coin_purchase_reward, coin_gift_receive_reward,
@@ -2388,32 +2437,32 @@ export const updateRootWalletSettings = (req, res, next) => {
       maxCoinSavingsDeposit, coinPerEtb, minCoinConversion, maxCoinConversion,
       minDeposit, maxDeposit, minWithdrawal, maxWithdrawal, minBonusWithdrawal, maxBonusWithdrawal,
       bonusToRealRate
-    );
-    json(res, roleRates(normalizedRole));
+    ));
+    json(res, await (roleRates(normalizedRole)));
   } catch (error) { next(error); }
 };
 
-export const updateWithdrawal = (req, res, next) => {
+export const updateWithdrawal = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
     const { status } = req.body || {};
     if (!['paid', 'rejected'].includes(status)) return res.status(400).json({ success: false, message: 'Choose paid or rejected.' });
-    const withdrawal = db().prepare('SELECT * FROM wallet_withdrawals WHERE withdrawal_id = ? AND status = ?').get(req.params.withdrawalId, 'pending');
+    const withdrawal = await (db().prepare('SELECT * FROM wallet_withdrawals WHERE withdrawal_id = ? AND status = ?').get(req.params.withdrawalId, 'pending'));
     if (!withdrawal) return res.status(404).json({ success: false, message: 'Pending withdrawal not found.' });
-    const update = db().transaction(() => {
-      db().prepare('UPDATE wallet_withdrawals SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE withdrawal_id = ?')
-        .run(status, withdrawal.withdrawal_id);
+    const update = db().transaction(async () => {
+      await (db().prepare('UPDATE wallet_withdrawals SET status = ?, updated_at = CURRENT_TIMESTAMP::text WHERE withdrawal_id = ?')
+        .run(status, withdrawal.withdrawal_id));
       if (status === 'paid') {
-        creditWallet(withdrawal.user_id, -withdrawal.amount, 'withdrawal', `withdrawal:${withdrawal.withdrawal_id}`, `${withdrawal.balance_type === 'bonus' ? 'Bonus' : 'Real'} wallet withdrawal paid`, withdrawal.balance_type || 'real');
+        await (creditWallet(withdrawal.user_id, -withdrawal.amount, 'withdrawal', `withdrawal:${withdrawal.withdrawal_id}`, `${withdrawal.balance_type === 'bonus' ? 'Bonus' : 'Real'} wallet withdrawal paid`, withdrawal.balance_type || 'real'));
       }
-      notify(withdrawal.user_id, null, `withdrawal_${status}`, `Your wallet withdrawal was ${status}.`, '/wallet');
+      await (notify(withdrawal.user_id, null, `withdrawal_${status}`, `Your wallet withdrawal was ${status}.`, '/wallet'));
     });
-    update();
+    await update();
     json(res, { withdrawalId: withdrawal.withdrawal_id, status });
   } catch (error) { next(error); }
 };
 
-export const updateDeposit = (req, res, next) => {
+export const updateDeposit = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
     const { status } = req.body || {};
@@ -2422,27 +2471,27 @@ export const updateDeposit = (req, res, next) => {
     }
 
     let deposit;
-    const decide = db().transaction(() => {
-      deposit = db().prepare("SELECT * FROM wallet_deposits WHERE deposit_id = ? AND status = 'pending'")
-        .get(req.params.depositId);
+    const decide = db().transaction(async () => {
+      deposit = await (db().prepare("SELECT * FROM wallet_deposits WHERE deposit_id = ? AND status = 'pending'")
+        .get(req.params.depositId));
       if (!deposit) return false;
-      const result = db().prepare(`
-        UPDATE wallet_deposits SET status = ?, updated_at = CURRENT_TIMESTAMP
+      const result = await (db().prepare(`
+        UPDATE wallet_deposits SET status = ?, updated_at = CURRENT_TIMESTAMP::text
         WHERE deposit_id = ? AND status = 'pending'
-      `).run(status, deposit.deposit_id);
+      `).run(status, deposit.deposit_id));
       if (result.changes !== 1) return false;
       if (status === 'approved') {
-        creditWallet(deposit.user_id, deposit.amount, 'deposit', `deposit:${deposit.deposit_id}`, 'Wallet deposit approved');
+        await (creditWallet(deposit.user_id, deposit.amount, 'deposit', `deposit:${deposit.deposit_id}`, 'Wallet deposit approved'));
       }
-      notify(deposit.user_id, null, `deposit_${status}`, `Your wallet deposit was ${status}.`, '/wallet');
+      await (notify(deposit.user_id, null, `deposit_${status}`, `Your wallet deposit was ${status}.`, '/wallet'));
       return true;
     });
-    if (!decide()) return res.status(404).json({ success: false, message: 'Pending deposit request not found.' });
+    if (!await decide()) return res.status(404).json({ success: false, message: 'Pending deposit request not found.' });
     json(res, { depositId: deposit.deposit_id, status });
   } catch (error) { next(error); }
 };
 
-export const adjustWalletBalance = (req, res, next) => {
+export const adjustWalletBalance = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
     const userId = String(req.body?.userId || '');
@@ -2450,39 +2499,39 @@ export const adjustWalletBalance = (req, res, next) => {
     const requestedAmount = Number(req.body?.amount);
     const amount = balanceType === 'coin' ? requestedAmount : Math.round(requestedAmount * 100) / 100;
     const reason = String(req.body?.reason || '').trim();
-    const user = db().prepare('SELECT username FROM users WHERE CAST(_id AS TEXT) = ?').get(userId);
+    const user = await (db().prepare('SELECT username FROM users WHERE CAST(_id AS TEXT) = ?').get(userId));
     if (!user || !Number.isFinite(amount) || amount === 0 || !validText(reason, 250) ||
         !['real', 'bonus', 'coin'].includes(balanceType) ||
         (balanceType === 'coin' && !Number.isSafeInteger(amount))) {
       return res.status(400).json({ success: false, message: 'Choose an account, balance type, valid non-zero amount, and reason (up to 250 characters). Coin adjustments must be whole numbers.' });
     }
     const reference = `manual:${randomUUID()}`;
-    const adjust = db().transaction(() => {
+    const adjust = db().transaction(async () => {
       if (balanceType === 'coin') {
-        const available = coinBalance(userId);
+        const available = await (coinBalance(userId));
         if (amount < 0 && available + amount < 0) throw new Error('Adjustment would make the available coin balance negative.');
-        if (!creditCoins(userId, amount, 'coin_admin_adjustment', reference, `Administrator coin adjustment: ${reason}`)) {
+        if (!await creditCoins(userId, amount, 'coin_admin_adjustment', reference, `Administrator coin adjustment: ${reason}`)) {
           throw new Error('Could not record the coin adjustment.');
         }
-        notify(userId, null, 'coin_admin_adjustment', `Your coin balance was adjusted by ${amount} coins.`, '/wallet');
+        await (notify(userId, null, 'coin_admin_adjustment', `Your coin balance was adjusted by ${amount} coins.`, '/wallet'));
         return;
       }
-      const available = db().prepare(`
+      const available = await (db().prepare(`
         SELECT COALESCE(SUM(l.amount), 0) -
           COALESCE((SELECT SUM(w.amount) FROM wallet_withdrawals w
             WHERE w.user_id = ? AND w.balance_type = ? AND w.status IN ('pending', 'approved')), 0) -
           COALESCE((SELECT SUM(r.amount) FROM agent_wallet_requests r
             WHERE r.user_id = ? AND r.request_type = 'withdrawal' AND r.status = 'pending' AND ? = 'real'), 0) AS balance
         FROM wallet_ledger l WHERE l.user_id = ? AND l.balance_type = ?
-      `).get(userId, balanceType, userId, balanceType, userId, balanceType).balance;
+      `).get(userId, balanceType, userId, balanceType, userId, balanceType)).balance;
       if (amount < 0 && available + amount < 0) throw new Error('Adjustment would make the available balance negative.');
-      if (!creditWallet(userId, amount, 'admin_adjustment', reference, `Administrator adjustment: ${reason}`, balanceType)) {
+      if (!await (creditWallet(userId, amount, 'admin_adjustment', reference, `Administrator adjustment: ${reason}`, balanceType))) {
         throw new Error('Could not record the wallet adjustment.');
       }
       const balanceLabel = balanceType === 'bonus' ? 'bonus/reward' : 'real';
-      notify(userId, null, 'wallet_adjustment', `Your ${balanceLabel} wallet was adjusted by ${amount.toFixed(2)}.`, '/wallet');
+      await (notify(userId, null, 'wallet_adjustment', `Your ${balanceLabel} wallet was adjusted by ${amount.toFixed(2)}.`, '/wallet'));
     });
-    adjust();
+    await adjust();
     json(res, { userId, username: user.username, amount, balanceType, reference }, 201);
   } catch (error) {
     if (['Adjustment would make the available balance negative.', 'Adjustment would make the available coin balance negative.'].includes(error.message)) {
@@ -2492,36 +2541,36 @@ export const adjustWalletBalance = (req, res, next) => {
   }
 };
 
-export const getMyReferralCode = (req, res, next) => {
-  try { json(res, { referralCode: ensureReferralCode(currentId(req)) }); }
+export const getMyReferralCode = async (req, res, next) => {
+  try { json(res, { referralCode: await (ensureReferralCode(currentId(req))) }); }
   catch (error) { next(error); }
 };
 
-export const rewardApprovedSale = (customerUserId, requestId, saleAmount) => {
+export const rewardApprovedSale = async (customerUserId, requestId, saleAmount) => {
   if (!customerUserId || !Number.isFinite(Number(saleAmount)) || Number(saleAmount) <= 0) return;
-  const attributed = db().prepare('SELECT inviter_user_id FROM social_referral_joins WHERE new_user_id = ?')
-    .get(String(customerUserId));
+  const attributed = await (db().prepare('SELECT inviter_user_id FROM social_referral_joins WHERE new_user_id = ?')
+    .get(String(customerUserId)));
   const referrerId = attributed?.inviter_user_id;
-  const customer = db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(customerUserId));
+  const customer = await (db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(customerUserId)));
   if (customer) {
-    const customerRates = roleRates(customer.role);
-    creditCoins(customerUserId, customerRates.coin_purchase_reward, 'coin_purchase_reward', `coin-approved-purchase:${requestId}`, 'Coins for an approved booking or product purchase');
+    const customerRates = await (roleRates(customer.role));
+    await creditCoins(customerUserId, customerRates.coin_purchase_reward, 'coin_purchase_reward', `coin-approved-purchase:${requestId}`, 'Coins for an approved booking or product purchase');
     if (customerRates.coin_purchase_reward > 0) {
-      notify(customerUserId, null, 'coin_reward', `🎉 You received ${customerRates.coin_purchase_reward} coins for your approved purchase.`, '/wallet');
+      await (notify(customerUserId, null, 'coin_reward', `🎉 You received ${customerRates.coin_purchase_reward} coins for your approved purchase.`, '/wallet'));
     }
   }
   if (!referrerId) return;
-  const referrer = db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(referrerId));
-  const referrerRates = roleRates(referrer?.role);
+  const referrer = await (db().prepare('SELECT role FROM users WHERE _id = ?').get(Number(referrerId)));
+  const referrerRates = await (roleRates(referrer?.role));
   if (referrerRates.invite_reward_trigger === 'first_approved_purchase' || referrerRates.invite_reward_trigger === 'both') {
-    const inviteReward = creditPlatformReward(
+    const inviteReward = await creditPlatformReward(
       referrerId,
       referrerRates.invite_reward,
       'invite_reward',
       `invite-approved-purchase:${customerUserId}`,
       'Invite reward for first approved referred purchase'
     );
-    const coinInviteReward = creditCoins(
+    const coinInviteReward = await creditCoins(
       referrerId,
       referrerRates.coin_invite_reward,
       'coin_invite_reward',
@@ -2529,15 +2578,15 @@ export const rewardApprovedSale = (customerUserId, requestId, saleAmount) => {
       'Invite coins for first approved referred purchase'
     );
     if (inviteReward || coinInviteReward) {
-      notify(referrerId, customerUserId, 'invite_reward', '🎉 Your invited member completed an approved purchase. Your invite reward was added to your wallet.', '/wallet');
+      await (notify(referrerId, customerUserId, 'invite_reward', '🎉 Your invited member completed an approved purchase. Your invite reward was added to your wallet.', '/wallet'));
     }
   }
   const agentSettings = String(referrer?.role || '').toLowerCase() === 'agent'
-    ? db().prepare('SELECT reward_percent FROM agent_settings WHERE agent_user_id = ?').get(String(referrerId))
+    ? await (db().prepare('SELECT reward_percent FROM agent_settings WHERE agent_user_id = ?').get(String(referrerId)))
     : null;
   const rate = Number(agentSettings?.reward_percent ?? referrerRates.product_sale_percent);
   const commission = Math.round(Number(saleAmount) * rate) / 100;
-  if (creditPlatformReward(
+  if (await creditPlatformReward(
     referrerId,
     commission,
     'product_sale',
@@ -2545,11 +2594,11 @@ export const rewardApprovedSale = (customerUserId, requestId, saleAmount) => {
     'Commission for an approved referred sale',
     String(referrer?.role || '').toLowerCase() === 'agent' ? referrerId : null
   )) {
-    notify(referrerId, customerUserId, 'sale_commission', `You earned ${commission.toFixed(2)} for an approved sale.`, '/wallet');
+    await (notify(referrerId, customerUserId, 'sale_commission', `You earned ${commission.toFixed(2)} for an approved sale.`, '/wallet'));
   }
 };
 
-export const settleMarketplaceSale = (ownerUserId, requestId, productAmount, serviceCharge) => {
+export const settleMarketplaceSale = async (ownerUserId, requestId, productAmount, serviceCharge) => {
   const ownerAmount = Math.round(Number(productAmount) * 100) / 100;
   const platformAmount = Math.round(Number(serviceCharge) * 100) / 100;
   if (!ownerUserId || !requestId || !Number.isFinite(ownerAmount) || ownerAmount <= 0 ||
@@ -2557,16 +2606,16 @@ export const settleMarketplaceSale = (ownerUserId, requestId, productAmount, ser
     throw new Error('Marketplace sale settlement details are invalid.');
   }
 
-  const settle = db().transaction(() => {
-    const ownerCredited = creditWallet(
+  const settle = db().transaction(async () => {
+    const ownerCredited = await (creditWallet(
       ownerUserId,
       ownerAmount,
       'marketplace_sale',
       `marketplace-sale:${requestId}`,
       'Payment for an approved marketplace product sale',
       'real'
-    );
-    const platformCredited = platformAmount === 0 || db().prepare(`
+    ));
+    const platformCredited = platformAmount === 0 || await (db().prepare(`
       INSERT OR IGNORE INTO platform_service_charge_ledger (
         entry_id, amount, request_id, entry_type, reference, description
       ) VALUES (?, ?, ?, 'service_charge', ?, ?)
@@ -2576,18 +2625,18 @@ export const settleMarketplaceSale = (ownerUserId, requestId, productAmount, ser
       String(requestId),
       `marketplace-service-charge:${requestId}`,
       'Platform service charge for an approved marketplace product sale'
-    ).changes === 1;
+    )).changes === 1;
     return { ownerCredited, platformCredited };
   })();
 
   if (settle.ownerCredited) {
-    notify(
+    await (notify(
       ownerUserId,
       null,
       'marketplace_sale',
       `A marketplace sale was approved. ETB ${ownerAmount.toFixed(2)} was added to your real wallet balance.`,
       '/wallet'
-    );
+    ));
   }
   return settle;
 };
