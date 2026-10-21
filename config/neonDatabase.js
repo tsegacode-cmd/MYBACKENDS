@@ -98,6 +98,15 @@ export const initializeNeonDatabase = async () => {
 };
 
 export const queryNeon = async (sql, params = []) => {
+  // Auto-initialize if pool is null but DATABASE_URL exists
+  if (!pool && process.env.DATABASE_URL) {
+    try {
+      await initializeNeonDatabase();
+    } catch (err) {
+      console.error('❌ Auto-initialization during query failed:', err.message);
+    }
+  }
+
   if (!pool) {
     const error = new Error(
       process.env.DATABASE_URL
@@ -117,6 +126,10 @@ export const queryNeon = async (sql, params = []) => {
 };
 
 export const withNeonTransaction = async (callback) => {
+  if (!pool && process.env.DATABASE_URL) {
+    await initializeNeonDatabase();
+  }
+
   if (!pool) {
     throw new Error('Neon PostgreSQL is not initialized; call initializeNeonDatabase first');
   }
@@ -143,3 +156,10 @@ export const closeNeonDatabase = async () => {
 };
 
 export const getNeonPool = () => pool;
+
+// Automatically initialize Neon database on module load if DATABASE_URL is available
+if (process.env.DATABASE_URL) {
+  initializeNeonDatabase().catch((error) => {
+    console.error('❌ Neon database auto-initialization error:', error.message);
+  });
+}
