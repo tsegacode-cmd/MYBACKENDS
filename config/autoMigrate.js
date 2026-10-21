@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 
 /**
  * Auto-migrate database schema on server startup
- * Creates tables (including missing user columns) first, then synchronizes root user
+ * Creates tables and ensures all required user columns (including last_login) exist.
  */
 export const autoMigrateDatabase = async () => {
   console.log('🔄 Running auto-migration (PostgreSQL)...');
@@ -16,7 +16,7 @@ export const autoMigrateDatabase = async () => {
       return false;
     }
 
-    // 1. CREATE TABLES FIRST (Including created_by_user_id, created_by_role, commission_settings)
+    // 1. CREATE TABLES FIRST (Including last_login, commission_settings, etc.)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -31,6 +31,7 @@ export const autoMigrateDatabase = async () => {
         commission_settings TEXT,
         created_by_user_id VARCHAR(255),
         created_by_role VARCHAR(50),
+        last_login TIMESTAMP,
         is_active INTEGER DEFAULT 1,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -45,6 +46,8 @@ export const autoMigrateDatabase = async () => {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS position VARCHAR(100);
     `).catch(() => {});
 
     await pool.query(`
