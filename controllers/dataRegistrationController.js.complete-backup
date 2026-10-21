@@ -1,0 +1,273 @@
+import { getRawSQLiteDB } from '../config/databaseManager.js';
+
+// Get all data registrations
+export const getAllRegistrations = async (req, res, next) => {
+  try {
+    const db = getRawSQLiteDB();
+    
+    if (!db) {
+      return res.status(500).json({
+        success: false,
+        message: 'Database not available'
+      });
+    }
+
+    const registrations = db.prepare('SELECT * FROM data_registrations ORDER BY created_at DESC').all();
+    
+    // Convert _id to id for frontend compatibility
+    const formattedRegistrations = registrations.map(reg => ({
+      ...reg,
+      id: reg._id
+    }));
+
+    res.json({
+      success: true,
+      data: formattedRegistrations
+    });
+  } catch (error) {
+    console.error('Failed to get registrations:', error);
+    next(error);
+  }
+};
+
+// Get single registration by ID
+export const getRegistrationById = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const db = getRawSQLiteDB();
+    
+    if (!db) {
+      return res.status(500).json({
+        success: false,
+        message: 'Database not available'
+      });
+    }
+
+    const registration = db.prepare('SELECT * FROM data_registrations WHERE _id = ?').get(id);
+
+    if (!registration) {
+      return res.status(404).json({
+        success: false,
+        message: 'Registration not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: { ...registration, id: registration._id }
+    });
+  } catch (error) {
+    console.error('Failed to get registration:', error);
+    next(error);
+  }
+};
+
+// Create new data registration
+
+// Create new data registration - EXACT COLUMN MATCHING
+export const createRegistration = async (req, res, next) => {
+  try {
+    console.log('🔴 EXACT MATCH INSERT - Received:', Object.keys(req.body).length, 'fields');
+    console.log('🔴 Field names:', Object.keys(req.body));
+    console.log('🔴 client_name:', req.body.client_name);
+    console.log('🔴 kebele:', req.body.kebele);
+    console.log('🔴 client_phone:', req.body.client_phone);
+    
+    const db = getRawSQLiteDB();
+    if (!db) {
+      return res.status(500).json({ success: false, message: 'Database not available' });
+    }
+
+    // Extract exactly the 27 columns we need (excluding _id, created_at, updated_at)
+    // Use client_name for now (database hasn't been renamed yet)
+    const exactData = {
+      work_type: req.body.work_type || null,
+      staff_id: req.body.staff_id || null,
+      staff_username: req.body.staff_username || 'N/A',
+      staff_full_name: req.body.staff_full_name || 'N/A',
+      client_name: req.body.client_name || req.body.payer_name || '',
+      city: req.body.city || 'Harar',
+      kebele: req.body.kebele || '',
+      house_no: req.body.house_no || null,
+      receipt_no: req.body.receipt_no || null,
+      client_phone: req.body.client_phone || '',
+      tv_no: req.body.tv_no || '1',
+      person: req.body.person || 'personal',
+      client_email: req.body.client_email || null,
+      condition: req.body.condition || 'new',
+      sign: req.body.sign || 'sign',
+      gov_letter: req.body.gov_letter || 'accept',
+      paid_amount: req.body.paid_amount || null,
+      payment_status: req.body.payment_status || 'unpaid',
+      payment_period_type: req.body.payment_period_type || '2014-2018',
+      payment_period_from: req.body.payment_period_from || null,
+      payment_period_to: req.body.payment_period_to || null,
+      commission_period_amount: req.body.commission_period_amount || null,
+      commission_fee: req.body.commission_fee || null,
+      commission_total: req.body.commission_total || null,
+      collected_amount: req.body.collected_amount || null,
+      registration_datetime: req.body.registration_datetime || null,
+      registered_at: new Date().toISOString()
+    };
+
+    // Validate required fields - use client_name for now
+    if (!exactData.client_name || !exactData.kebele || !exactData.client_phone) {
+      console.log('❌ Missing required fields:');
+      console.log('   client_name:', exactData.client_name);
+      console.log('   kebele:', exactData.kebele);
+      console.log('   client_phone:', exactData.client_phone);
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Missing required fields: client_name, kebele, client_phone',
+        debug: {
+          client_name: exactData.client_name,
+          kebele: exactData.kebele,
+          client_phone: exactData.client_phone,
+          received_fields: Object.keys(req.body)
+        }
+      });
+    }
+
+    const columns = Object.keys(exactData);
+    const values = Object.values(exactData);
+    const placeholders = columns.map(() => '?').join(', ');
+
+    console.log('🟢 EXACT MATCH - Columns:', columns.length);
+    console.log('🟢 EXACT MATCH - Values:', values.length);
+    console.log('🟢 Column names:', columns.join(', '));
+
+    // INSERT with exactly 27 columns
+    const stmt = db.prepare(`
+      INSERT INTO data_registrations (${columns.join(', ')})
+      VALUES (${placeholders})
+    `);
+
+    const result = stmt.run(...values);
+
+    console.log('✅ EXACT MATCH INSERT SUCCESS - ID:', result.lastInsertRowid);
+
+    res.status(201).json({
+      success: true,
+      message: 'Registration created successfully',
+      data: { id: result.lastInsertRowid, ...exactData }
+    });
+
+  } catch (error) {
+    console.error('❌ EXACT MATCH INSERT FAILED:', error);
+    res.status(500).json({ success: false, message: 'Insert failed: ' + error.message });
+  }
+};
+
+
+// export const updateRegistration = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+
+    const db = getRawSQLiteDB();
+    
+    if (!db) {
+      return res.status(500).json({
+        success: false,
+        message: 'Database not available'
+      });
+    }
+
+    // Get existing columns from the table
+    const tableInfo = db.prepare('PRAGMA table_info(data_registrations)').all();
+    const existingColumns = new Set(tableInfo.map(col => col.name));
+
+    // Filter updates to only include fields that exist in the database
+    const filteredUpdates = {};
+    const skippedFields = [];
+    
+    for (const [key, value] of Object.entries(updates)) {
+      if (existingColumns.has(key)) {
+        filteredUpdates[key] = value;
+      } else {
+        skippedFields.push(key);
+      }
+    }
+
+    // Log skipped fields for debugging
+    if (skippedFields.length > 0) {
+      console.log(`Skipped non-existent columns: ${skippedFields.join(', ')}`);
+    }
+
+    // Build dynamic UPDATE query with filtered fields
+    const fields = [];
+    const values = [];
+
+    for (const [key, value] of Object.entries(filteredUpdates)) {
+      fields.push(`${key} = ?`);
+      values.push(value);
+    }
+
+    if (fields.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No valid fields to update'
+      });
+    }
+
+    fields.push('updated_at = datetime(\'now\')');
+    values.push(id);
+
+    const stmt = db.prepare(`
+      UPDATE data_registrations 
+      SET ${fields.join(', ')}
+      WHERE _id = ?
+    `);
+
+    const result = stmt.run(...values);
+
+    if (result.changes === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Registration not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Registration updated successfully',
+      skippedFields: skippedFields.length > 0 ? skippedFields : undefined
+    });
+  } catch (error) {
+    console.error('Failed to update registration:', error);
+    next(error);
+  }
+};
+
+// Delete data registration
+export const deleteRegistration = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const db = getRawSQLiteDB();
+    
+    if (!db) {
+      return res.status(500).json({
+        success: false,
+        message: 'Database not available'
+      });
+    }
+
+    const stmt = db.prepare('DELETE FROM data_registrations WHERE _id = ?');
+    const result = stmt.run(id);
+
+    if (result.changes === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Registration not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Registration deleted successfully'
+    });
+  } catch (error) {
+    console.error('Failed to delete registration:', error);
+    next(error);
+  }
+};

@@ -1,0 +1,394 @@
+import { getRawSQLiteDB } from '../config/databaseManager.js';
+
+// Get all data registrations
+export const getAllRegistrations = async (req, res, next) => {
+  try {
+    const db = getRawSQLiteDB();
+    
+    if (!db) {
+      return res.status(500).json({
+        success: false,
+        message: 'Database not available'
+      });
+    }
+
+    const registrations = db.prepare('SELECT * FROM data_registrations ORDER BY created_at DESC').all();
+    
+    // Convert _id to id for frontend compatibility
+    const formattedRegistrations = registrations.map(reg => ({
+      ...reg,
+      id: reg._id
+    }));
+
+    res.json({
+      success: true,
+      data: formattedRegistrations
+    });
+  } catch (error) {
+    console.error('Failed to get registrations:', error);
+    next(error);
+  }
+};
+
+// Get single registration by ID
+export const getRegistrationById = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const db = getRawSQLiteDB();
+    
+    if (!db) {
+      return res.status(500).json({
+        success: false,
+        message: 'Database not available'
+      });
+    }
+
+    const registration = db.prepare('SELECT * FROM data_registrations WHERE _id = ?').get(id);
+
+    if (!registration) {
+      return res.status(404).json({
+        success: false,
+        message: 'Registration not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: { ...registration, id: registration._id }
+    });
+  } catch (error) {
+    console.error('Failed to get registration:', error);
+    next(error);
+  }
+};
+
+// Create new data registration
+export const createRegistration = async (req, res, next) => {
+  try {
+    // EMERGENCY LOGGING - Log what frontend sends
+    console.log('🔴 BACKEND RECEIVED:', Object.keys(req.body).length, 'fields')
+    console.log('🔴 Field names:', Object.keys(req.body))
+    
+    // AGGRESSIVE FIX: Remove any problematic fields that shouldn't be there
+    const cleanBody = { ...req.body };
+    delete cleanBody.registered_at;  // Remove if present
+    delete cleanBody.created_at;     // Remove if present
+    delete cleanBody.updated_at;     // Remove if present
+    delete cleanBody._id;            // Remove if present
+    delete cleanBody.id;             // Remove if present
+    
+    console.log('🟢 AFTER CLEANUP:', Object.keys(cleanBody).length, 'fields')
+    console.log('🟢 Clean field names:', Object.keys(cleanBody))
+    
+    const {
+      work_type,
+      staff_id,
+      staff_username,
+      staff_full_name,
+      client_name,
+      city,
+      kebele,
+      house_no,
+      receipt_no,
+      client_phone,
+      tv_no,
+      person,
+      client_email,
+      condition,
+      sign,
+      gov_letter,
+      paid_amount,
+      payment_status,
+      payment_period_type,
+      payment_period_from,
+      payment_period_to,
+      commission_period_amount,
+      commission_fee,
+      commission_total,
+      collected_amount,
+      registration_datetime
+    } = cleanBody;
+
+    // Validate required fields
+    if (!work_type || !client_name || !kebele || !client_phone || !tv_no || !person || !condition || !sign) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields'
+      });
+    }
+
+    const db = getRawSQLiteDB();
+    
+    if (!db) {
+      return res.status(500).json({
+        success: false,
+        message: 'Database not available'
+      });
+    }
+
+    // Get existing columns from the table
+    const tableInfo = db.prepare('PRAGMA table_info(data_registrations)').all();
+    const existingColumns = new Set(tableInfo.map(col => col.name));
+
+    // Build dynamic INSERT query with only existing columns
+    const allFields = {
+      work_type,
+      staff_id: staff_id || null,
+      staff_username: staff_username || 'N/A',
+      staff_full_name: staff_full_name || 'N/A',
+      client_name,
+      city: city || 'Harar',
+      kebele,
+      house_no: house_no || null,
+      receipt_no: receipt_no || null,
+      client_phone,
+      tv_no,
+      person,
+      client_email: client_email || null,
+      condition,
+      sign,
+      gov_letter: gov_letter || 'accept',
+      paid_amount: paid_amount || null,
+      payment_status: payment_status || 'unpaid',
+      payment_period_type: payment_period_type || '2014-2018',
+      payment_period_from: payment_period_from || null,
+      payment_period_to: payment_period_to || null,
+      commission_period_amount: commission_period_amount || null,
+      commission_fee: commission_fee || null,
+      commission_total: commission_total || null,
+      collected_amount: collected_amount || null,
+      registration_datetime: registration_datetime || null
+    };
+
+    // Filter to only include fields that exist in the database
+    const fields = [];
+    const values = [];
+    const skippedFields = [];
+    
+    // AGGRESSIVE FILTER: Only allow specific safe fields
+    const allowedFields = [
+      'work_type', 'staff_id', 'staff_username', 'staff_full_name', 'client_name',
+      'city', 'kebele', 'house_no', 'receipt_no', 'client_phone', 'tv_no',
+      'person', 'client_email', 'condition', 'sign', 'gov_letter', 'paid_amount',
+      'payment_status', 'payment_period_type', 'payment_period_from', 'payment_period_to',
+      'commission_period_amount', 'commission_fee', 'commission_total', 'collected_amount',
+      'registration_datetime'
+    ];
+
+    for (const [key, value] of Object.entries(allFields)) {
+      if (existingColumns.has(key) && allowedFields.includes(key)) {
+        fields.push(key);
+        values.push(value);
+      } else {
+        skippedFields.push(key);
+      }
+    }
+
+    // DO NOT add created_at - let database handle it with DEFAULT
+    // fields.push('created_at');
+    // values.push(new Date().toISOString());
+
+    // AGGRESSIVE DEBUG LOGGING
+    console.log('=== INSERT DEBUG ===');
+    console.log('Total fields:', fields.length);
+    console.log('Total values:', values.length);
+    console.log('Fields:', fields);
+    console.log('Values:', values);
+    console.log('===================');
+    
+    // CRITICAL CHECK
+    if (fields.length !== values.length) {
+      console.error('❌ MISMATCH DETECTED!');
+      console.error(`Fields: ${fields.length}, Values: ${values.length}`);
+      return res.status(500).json({
+        success: false,
+        message: `Column mismatch: ${fields.length} fields but ${values.length} values`,
+        debug: {
+          fields: fields,
+          values: values,
+          fieldsCount: fields.length,
+          valuesCount: values.length
+        }
+      });
+    }
+
+    // Log skipped fields for debugging
+    if (skippedFields.length > 0) {
+      console.log(`Skipped non-existent columns during INSERT: ${skippedFields.join(', ')}`);
+    }
+
+    const placeholders = fields.map(() => '?').join(', ');
+    
+    console.log('SQL:', `INSERT INTO data_registrations (${fields.join(', ')}) VALUES (${placeholders})`);
+    
+    // EMERGENCY FIX: Try INSERT with error handling
+    let result;
+    try {
+      const stmt = db.prepare(`
+        INSERT INTO data_registrations (${fields.join(', ')})
+        VALUES (${placeholders})
+      `);
+      result = stmt.run(...values);
+    } catch (insertError) {
+      console.error('❌ INSERT FAILED:', insertError.message);
+      
+      // FALLBACK: Try with fewer fields if there's a mismatch
+      if (insertError.message.includes('values') && insertError.message.includes('columns')) {
+        console.log('🔧 ATTEMPTING FALLBACK INSERT...');
+        
+        // Try with only the most essential fields
+        const essentialFields = ['work_type', 'client_name', 'kebele', 'client_phone', 'tv_no', 'person', 'condition', 'sign', 'payment_status'];
+        const fallbackFields = [];
+        const fallbackValues = [];
+        
+        essentialFields.forEach(field => {
+          if (existingColumns.has(field) && allFields[field] !== undefined) {
+            fallbackFields.push(field);
+            fallbackValues.push(allFields[field]);
+          }
+        });
+        
+        console.log('🔧 Fallback fields:', fallbackFields.length);
+        console.log('🔧 Fallback values:', fallbackValues.length);
+        
+        const fallbackPlaceholders = fallbackFields.map(() => '?').join(', ');
+        const fallbackStmt = db.prepare(`
+          INSERT INTO data_registrations (${fallbackFields.join(', ')})
+          VALUES (${fallbackPlaceholders})
+        `);
+        
+        result = fallbackStmt.run(...fallbackValues);
+        console.log('✅ FALLBACK INSERT SUCCEEDED!');
+      } else {
+        throw insertError;
+      }
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Registration created successfully',
+      data: {
+        id: result.lastInsertRowid,
+        ...allFields
+      },
+      skippedFields: skippedFields.length > 0 ? skippedFields : undefined
+    });
+  } catch (error) {
+    console.error('Failed to create registration:', error);
+    next(error);
+  }
+};
+
+// Update data registration
+export const updateRegistration = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+
+    const db = getRawSQLiteDB();
+    
+    if (!db) {
+      return res.status(500).json({
+        success: false,
+        message: 'Database not available'
+      });
+    }
+
+    // Get existing columns from the table
+    const tableInfo = db.prepare('PRAGMA table_info(data_registrations)').all();
+    const existingColumns = new Set(tableInfo.map(col => col.name));
+
+    // Filter updates to only include fields that exist in the database
+    const filteredUpdates = {};
+    const skippedFields = [];
+    
+    for (const [key, value] of Object.entries(updates)) {
+      if (existingColumns.has(key)) {
+        filteredUpdates[key] = value;
+      } else {
+        skippedFields.push(key);
+      }
+    }
+
+    // Log skipped fields for debugging
+    if (skippedFields.length > 0) {
+      console.log(`Skipped non-existent columns: ${skippedFields.join(', ')}`);
+    }
+
+    // Build dynamic UPDATE query with filtered fields
+    const fields = [];
+    const values = [];
+
+    for (const [key, value] of Object.entries(filteredUpdates)) {
+      fields.push(`${key} = ?`);
+      values.push(value);
+    }
+
+    if (fields.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No valid fields to update'
+      });
+    }
+
+    fields.push('updated_at = datetime(\'now\')');
+    values.push(id);
+
+    const stmt = db.prepare(`
+      UPDATE data_registrations 
+      SET ${fields.join(', ')}
+      WHERE _id = ?
+    `);
+
+    const result = stmt.run(...values);
+
+    if (result.changes === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Registration not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Registration updated successfully',
+      skippedFields: skippedFields.length > 0 ? skippedFields : undefined
+    });
+  } catch (error) {
+    console.error('Failed to update registration:', error);
+    next(error);
+  }
+};
+
+// Delete data registration
+export const deleteRegistration = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const db = getRawSQLiteDB();
+    
+    if (!db) {
+      return res.status(500).json({
+        success: false,
+        message: 'Database not available'
+      });
+    }
+
+    const stmt = db.prepare('DELETE FROM data_registrations WHERE _id = ?');
+    const result = stmt.run(id);
+
+    if (result.changes === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Registration not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Registration deleted successfully'
+    });
+  } catch (error) {
+    console.error('Failed to delete registration:', error);
+    next(error);
+  }
+};
