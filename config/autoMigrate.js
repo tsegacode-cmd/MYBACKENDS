@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 
 /**
  * Auto-migrate database schema on server startup
- * Creates tables (including commission_settings) first, then synchronizes root user and adds columns/indexes
+ * Creates tables (including missing user columns) first, then synchronizes root user
  */
 export const autoMigrateDatabase = async () => {
   console.log('🔄 Running auto-migration (PostgreSQL)...');
@@ -16,7 +16,7 @@ export const autoMigrateDatabase = async () => {
       return false;
     }
 
-    // 1. CREATE TABLES FIRST (Including commission_settings in users table)
+    // 1. CREATE TABLES FIRST (Including created_by_user_id, created_by_role, commission_settings)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -25,16 +25,26 @@ export const autoMigrateDatabase = async () => {
         full_name VARCHAR(255),
         role VARCHAR(50) DEFAULT 'user',
         position VARCHAR(100),
+        phone VARCHAR(50),
+        email VARCHAR(255),
+        permissions TEXT,
         commission_settings TEXT,
+        created_by_user_id VARCHAR(255),
+        created_by_role VARCHAR(50),
         is_active INTEGER DEFAULT 1,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
 
-    // Ensure commission_settings exists if users table was already created previously without it
+    // 2. Ensure all required columns exist in 'users' table if it was created previously
     await pool.query(`
       ALTER TABLE users ADD COLUMN IF NOT EXISTS commission_settings TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS created_by_user_id VARCHAR(255);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS created_by_role VARCHAR(50);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions TEXT;
     `).catch(() => {});
 
     await pool.query(`
@@ -77,7 +87,7 @@ export const autoMigrateDatabase = async () => {
       );
     `);
 
-    // 2. SYNCHRONIZE ROOT USER
+    // 3. SYNCHRONIZE ROOT USER
     const rootUsername = process.env.ROOT_USERNAME?.trim() || 'root';
     const rootPassword = process.env.ROOT_PASSWORD;
 
@@ -98,7 +108,7 @@ export const autoMigrateDatabase = async () => {
       console.warn('⚠️  ROOT_PASSWORD is not configured; skipping root-user credential migration');
     }
 
-    // 3. CHECK AND ADD MISSING COLUMNS TO data_registrations
+    // 4. CHECK AND ADD MISSING COLUMNS TO data_registrations
     const tableInfoQuery = `
       SELECT column_name as name 
       FROM information_schema.columns 
@@ -107,8 +117,6 @@ export const autoMigrateDatabase = async () => {
     const tableInfoResult = await pool.query(tableInfoQuery);
     const existingColumns = new Set(tableInfoResult.rows.map(col => col.name));
     
-    console.log(`   Found ${existingColumns.size} existing columns in data_registrations`);
-
     const newColumns = [
       { name: 'city', type: 'TEXT', default: "'Harar'" },
       { name: 'address', type: 'TEXT', default: 'NULL' },
@@ -126,29 +134,20 @@ export const autoMigrateDatabase = async () => {
     ];
 
     let addedCount = 0;
-    let skippedCount = 0;
-
     for (const column of newColumns) {
       if (!existingColumns.has(column.name)) {
         try {
           const sql = `ALTER TABLE data_registrations ADD COLUMN ${column.name} ${column.type} DEFAULT ${column.default}`;
           await pool.query(sql);
-          console.log(`   ✅ Added column: ${column.name}`);
+          console.log(`   ✅ Added column to data_registrations: ${column.name}`);
           addedCount++;
         } catch (error) {
           console.error(`   ❌ Failed to add column ${column.name}:`, error.message);
         }
-      } else {
-        skippedCount++;
       }
     }
 
-    if (addedCount > 0) {
-      console.log(`✅ Auto-migration completed: ${addedCount} columns added, ${skippedCount} already existed`);
-    } else {
-      console.log(`✅ Database schema is up to date (${skippedCount} columns checked)`);
-    }
-
+    console.log(`✅ Auto-migration completed successfully.`);
     return true;
   } catch (error) {
     console.error('❌ Auto-migration failed:', error.message);
