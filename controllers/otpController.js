@@ -4,7 +4,7 @@ import Database from 'better-sqlite3';
 import jwt from 'jsonwebtoken';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { awardDailyLoginCoins, ensureReferralCode, registerReferredUser } from './socialController.js';
+import { awardDailyLoginCoins, ensureReferralCode, registerReferredUser } from '../controllers/socialController.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const db = new Database(path.join(__dirname, '../database_files/redsea_brokerage.db'));
@@ -158,7 +158,11 @@ const getSecret = () => {
 };
 
 const getOtpEncryptionSecrets = () => {
-  const secrets = [process.env.OTP_ENCRYPTION_KEY, process.env.JWT_SECRET]
+  const secrets = [
+    process.env.OTP_ENCRYPTION_KEY,
+    process.env.JWT_SECRET,
+    process.env.OTP_ENCRYPTION_KEY_PREVIOUS,
+  ]
     .filter(Boolean);
   if (secrets.length === 0) getSecret();
   return [...new Set(secrets)];
@@ -207,15 +211,22 @@ const getConfig = () => {
   const row = db.prepare('SELECT encrypted_config FROM otp_settings WHERE id = 1').get();
   if (!row) return {};
 
-  const { config, needsReEncryption } = decryptConfig(row.encrypted_config);
-  if (needsReEncryption) {
-    db.prepare(`
-      UPDATE otp_settings
-      SET encrypted_config = ?, updated_at = datetime('now')
-      WHERE id = 1
-    `).run(encryptConfig(config));
+  try {
+    const { config, needsReEncryption } = decryptConfig(row.encrypted_config);
+    if (needsReEncryption) {
+      db.prepare(`
+        UPDATE otp_settings
+        SET encrypted_config = ?, updated_at = datetime('now')
+        WHERE id = 1
+      `).run(encryptConfig(config));
+    }
+    return config;
+  } catch (error) {
+    // 🛠️ ቁልፉ የማይዛመድ ከሆነ ወይም de-crypt ማድረግ ካልቻለ አሮጌውን አጥፍቶ ባዶ መቼት በመፍጠር ሰርቨሩ እንዳይቋረጥ ያደርጋል
+    console.error('Resetting incompatible OTP settings due to secret change:', error.message);
+    db.prepare('DELETE FROM otp_settings WHERE id = 1').run();
+    return {};
   }
-  return config;
 };
 
 const safeConfig = (config) => ({
