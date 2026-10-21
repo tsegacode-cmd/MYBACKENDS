@@ -1,7 +1,16 @@
 import { randomUUID } from 'crypto';
-import { getRawSQLiteDB } from '../config/sqliteDatabase.js';
+import { AsyncLocalStorage } from 'async_hooks';
+import { queryNeon, toPostgresPlaceholders, withNeonTransaction } from '../config/neonDatabase.js';
 
-const db = () => getRawSQLiteDB();
+const transactionContext = new AsyncLocalStorage();
+const query = async (sql, params = []) => {
+  const client = transactionContext.getStore();
+  return client
+    ? client.query(toPostgresPlaceholders(sql), params)
+    : queryNeon(sql, params);
+};
+const transaction = callback => withNeonTransaction(client =>
+  transactionContext.run(client, callback));
 const json = (res, data, status = 200) => res.status(status).json({ success: true, data });
 
 const normalizeCode = value => {
@@ -15,14 +24,8 @@ const ensureCodeText = value => {
   return normalized || `REDSEA-${randomUUID().slice(0, 8).toUpperCase().replace(/-/g, '')}`;
 };
 
-const formatPromoCode = (row, userId = '') => {
+const formatPromoCode = row => {
   if (!row) return null;
-  const claimedByMe = userId ? !!db().prepare(
-    'SELECT 1 FROM promo_code_claims WHERE code_id = ? AND user_id = ?'
-  ).get(String(row.code_id), String(userId)) : false;
-  const totalClaims = Number(db().prepare(
-    'SELECT COUNT(*) AS count FROM promo_code_claims WHERE code_id = ?'
-  ).get(String(row.code_id))?.count || 0);
   return {
     id: row.code_id,
     code: row.code,
@@ -33,34 +36,44 @@ const formatPromoCode = (row, userId = '') => {
     rewardUnit: row.reward_type === 'coin' ? 'coins' : 'ETB',
     expiresAt: row.expires_at || null,
     maxClaims: Number(row.max_claims || 0),
-    totalClaims,
+    totalClaims: Number(row.total_claims || 0),
     status: row.status || 'active',
-    broadcastToAll: Boolean(row.broadcast_to_all),
-    claimedByMe,
+    broadcastToAll: Boolean(Number(row.broadcast_to_all)),
+    claimedByMe: Boolean(row.claimed_by_me),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 };
 
-const rewardWalletEntry = (userId, amount, rewardType, codeLabel, description) => {
+const promoCodeSelect = `
+  SELECT p.*,
+    (SELECT COUNT(*) FROM promo_code_claims c WHERE c.code_id = p.code_id) AS total_claims,
+    EXISTS (
+      SELECT 1 FROM promo_code_claims c
+      WHERE c.code_id = p.code_id AND c.user_id = ?
+    ) AS claimed_by_me
+  FROM promo_codes p
+`;
+
+const rewardWalletEntry = async (userId, amount, rewardType, codeLabel, description) => {
   const safeAmount = Number(amount || 0);
   if (!Number.isFinite(safeAmount) || safeAmount <= 0) return false;
   const entryId = randomUUID();
   const reference = `promo-code:${codeLabel}:${Date.now()}:${entryId.slice(0, 8)}`;
   if (rewardType === 'coin') {
     if (!Number.isSafeInteger(safeAmount)) throw new Error('Coin rewards must be a whole number.');
-    const result = db().prepare(`
+    const result = await query(`
       INSERT INTO wallet_coin_ledger (entry_id, user_id, amount, entry_type, reference, description)
       VALUES (?, ?, ?, 'promo_code_reward', ?, ?)
-    `).run(entryId, String(userId), safeAmount, reference, description);
-    return result.changes === 1;
+    `, [entryId, String(userId), safeAmount, reference, description]);
+    return result.rowCount === 1;
   }
   const balanceType = rewardType === 'real' ? 'real' : 'bonus';
-  const result = db().prepare(`
+  const result = await query(`
     INSERT INTO wallet_ledger (entry_id, user_id, amount, entry_type, reference, description, currency, balance_type)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(entryId, String(userId), safeAmount, 'promo_code_reward', reference, description, 'ETB', balanceType);
-  return result.changes === 1;
+  `, [entryId, String(userId), safeAmount, 'promo_code_reward', reference, description, 'ETB', balanceType]);
+  return result.rowCount === 1;
 };
 
 const validateReward = (amount, rewardType) => {
@@ -84,36 +97,36 @@ const expiresAtFromDuration = (seconds, value) => {
   return new Date(Date.now() + durationSeconds * 1000).toISOString();
 };
 
-const notifyAllUsers = (message, link) => {
-  const users = db().prepare('SELECT CAST(_id AS TEXT) AS user_id FROM users WHERE is_active = 1').all();
-  for (const user of users) {
-    db().prepare(`
+const notifyAllUsers = async (message, link) => {
+  const users = await query('SELECT CAST(_id AS TEXT) AS user_id FROM users WHERE is_active = 1');
+  for (const user of users.rows) {
+    await query(`
       INSERT INTO social_notifications (notification_id, user_id, actor_id, type, message, link)
       VALUES (?, ?, ?, ?, ?, ?)
-    `).run(randomUUID(), String(user.user_id), null, 'promo_code', message, link);
+    `, [randomUUID(), String(user.user_id), null, 'promo_code', message, link]);
   }
 };
 
-export const getRootPromoCodes = (_req, res, next) => {
+export const getRootPromoCodes = async (_req, res, next) => {
   try {
-    db().prepare(`
+    await query(`
       UPDATE promo_codes
-      SET status = 'expired', updated_at = ?
+      SET status = 'expired', updated_at = CURRENT_TIMESTAMP::text
       WHERE status = 'active' AND expires_at IS NOT NULL
-        AND datetime(expires_at) <= datetime('now')
-    `).run(new Date().toISOString());
-    const rows = db().prepare(`
-      SELECT * FROM promo_codes
-      WHERE expires_at IS NULL OR datetime(expires_at) > datetime('now')
-      ORDER BY status DESC, created_at DESC
-    `).all();
-    json(res, { codes: rows.map(row => formatPromoCode(row)) });
+        AND expires_at::timestamptz <= CURRENT_TIMESTAMP
+    `);
+    const rows = await query(`
+      ${promoCodeSelect}
+      WHERE p.expires_at IS NULL OR p.expires_at::timestamptz > CURRENT_TIMESTAMP
+      ORDER BY p.status DESC, p.created_at DESC
+    `, ['']);
+    json(res, { codes: rows.rows.map(formatPromoCode) });
   } catch (error) {
     next(error);
   }
 };
 
-export const createRootPromoCode = (req, res, next) => {
+export const createRootPromoCode = async (req, res, next) => {
   try {
     const body = req.body || {};
     const title = String(body.title || body.name || 'Promo reward').trim() || 'Promo reward';
@@ -135,49 +148,38 @@ export const createRootPromoCode = (req, res, next) => {
       return res.status(400).json({ success: false, message: 'The expiration date must be a valid date.' });
     }
 
-    const saved = db().transaction(() => {
-      const existing = db().prepare('SELECT code_id FROM promo_codes WHERE code = ?').get(code);
-      if (existing) {
-        const error = new Error('A promo code with that value already exists.');
-        error.statusCode = 409;
-        throw error;
-      }
+    const saved = await transaction(async () => {
       const codeId = randomUUID();
       const now = new Date().toISOString();
-      db().prepare(`
+      await query(`
         INSERT INTO promo_codes (
           code_id, code, title, description, amount, reward_type, expires_at, max_claims,
           broadcast_to_all, status, created_by, created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
-      `).run(
-        codeId,
-        code,
-        title,
-        description,
-        amount,
-        rewardType,
-        expiresAt || null,
-        maxClaims,
-        isBroadcast ? 1 : 0,
-        req.user?.id ? String(req.user.id) : null,
-        now,
-        now,
-      );
-      const row = db().prepare('SELECT * FROM promo_codes WHERE code_id = ?').get(codeId);
+      `, [
+        codeId, code, title, description, amount, rewardType, expiresAt || null,
+        maxClaims, isBroadcast ? 1 : 0, req.user?.id ? String(req.user.id) : null, now, now,
+      ]);
+      const result = await query(`${promoCodeSelect} WHERE p.code_id = ?`, ['', codeId]);
       if (isBroadcast) {
-        notifyAllUsers(`New REDSEA promo code available: ${code}. Claim it before it expires.`, '/feed?tab=promo-codes');
+        await notifyAllUsers(`New REDSEA promo code available: ${code}. Claim it before it expires.`, '/feed?tab=promo-codes');
       }
-      return row;
-    })();
+      return result.rows[0];
+    });
 
     json(res, { code: formatPromoCode(saved) }, 201);
   } catch (error) {
-    const status = error.statusCode || 500;
-    res.status(status).json({ success: false, message: error.message || 'Could not create the promo code.' });
+    if (error.code === '23505') {
+      return res.status(409).json({ success: false, message: 'A promo code with that value already exists.' });
+    }
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ success: false, message: error.message });
+    }
+    next(error);
   }
 };
 
-export const createRootPromoCodeBatch = (req, res, next) => {
+export const createRootPromoCodeBatch = async (req, res, next) => {
   try {
     const body = req.body || {};
     const entries = Array.isArray(body.codes) ? body.codes : [];
@@ -210,70 +212,70 @@ export const createRootPromoCodeBatch = (req, res, next) => {
     if (uniqueCodes.size !== normalizedEntries.length) {
       return res.status(400).json({ success: false, message: 'Generated codes must be unique within the batch.' });
     }
-    const created = db().transaction(() => {
+    const created = await transaction(async () => {
       const saved = [];
-      const insertCode = db().prepare(`
-        INSERT INTO promo_codes (
-          code_id, code, title, description, amount, reward_type, expires_at, max_claims,
-          broadcast_to_all, status, created_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
-      `);
       const now = new Date().toISOString();
       for (const entry of normalizedEntries) {
-        if (db().prepare('SELECT 1 FROM promo_codes WHERE code = ?').get(entry.code)) {
-          throw Object.assign(new Error(`Promo code ${entry.code} already exists.`), { statusCode: 409 });
-        }
         const codeId = randomUUID();
-        insertCode.run(
+        await query(`
+          INSERT INTO promo_codes (
+            code_id, code, title, description, amount, reward_type, expires_at, max_claims,
+            broadcast_to_all, status, created_by, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+        `, [
           codeId, entry.code, title, description, entry.amount, rewardType, expiresAt,
-          maxClaims, isBroadcast ? 1 : 0, req.user?.id ? String(req.user.id) : null, now, now
-        );
-        saved.push(db().prepare('SELECT * FROM promo_codes WHERE code_id = ?').get(codeId));
+          maxClaims, isBroadcast ? 1 : 0, req.user?.id ? String(req.user.id) : null, now, now,
+        ]);
+        const result = await query(`${promoCodeSelect} WHERE p.code_id = ?`, ['', codeId]);
+        saved.push(result.rows[0]);
       }
       if (isBroadcast) {
         const codesText = normalizedEntries.map(entry => entry.code).join(', ');
         const message = `New REDSEA promo codes are available: ${codesText}. Claim before they expire.`;
-        notifyAllUsers(message.slice(0, 2000), '/feed?tab=daily-claim');
+        await notifyAllUsers(message.slice(0, 2000), '/feed?tab=daily-claim');
       }
       return saved;
-    })();
-    json(res, { codes: created.map(row => formatPromoCode(row)), broadcastToAll: isBroadcast }, 201);
+    });
+    json(res, { codes: created.map(formatPromoCode), broadcastToAll: isBroadcast }, 201);
   } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ success: false, message: 'One or more promo codes already exist.' });
+    }
     if (error.statusCode) return res.status(error.statusCode).json({ success: false, message: error.message });
     next(error);
   }
 };
 
-export const getActivePromoCodes = (req, res, next) => {
+export const getActivePromoCodes = async (req, res, next) => {
   try {
     const userId = req.user?.id ? String(req.user.id) : '';
-    db().prepare(`
+    await query(`
       UPDATE promo_codes
-      SET status = 'expired', updated_at = ?
+      SET status = 'expired', updated_at = CURRENT_TIMESTAMP::text
       WHERE status = 'active' AND expires_at IS NOT NULL
-        AND datetime(expires_at) <= datetime('now')
-    `).run(new Date().toISOString());
-    const rows = db().prepare(`
-      SELECT * FROM promo_codes
-      WHERE status = 'active'
-        AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
+        AND expires_at::timestamptz <= CURRENT_TIMESTAMP
+    `);
+    const rows = await query(`
+      ${promoCodeSelect}
+      WHERE p.status = 'active'
+        AND (p.expires_at IS NULL OR p.expires_at::timestamptz > CURRENT_TIMESTAMP)
         AND (
-          max_claims <= 0
-          OR (SELECT COUNT(*) FROM promo_code_claims WHERE code_id = promo_codes.code_id) < max_claims
+          p.max_claims <= 0
+          OR (SELECT COUNT(*) FROM promo_code_claims c WHERE c.code_id = p.code_id) < p.max_claims
           OR EXISTS (
-            SELECT 1 FROM promo_code_claims
-            WHERE code_id = promo_codes.code_id AND user_id = ?
+            SELECT 1 FROM promo_code_claims c
+            WHERE c.code_id = p.code_id AND c.user_id = ?
           )
         )
-      ORDER BY created_at DESC
-    `).all(userId);
-    json(res, { codes: rows.map(row => formatPromoCode(row, userId)) });
+      ORDER BY p.created_at DESC
+    `, [userId, userId]);
+    json(res, { codes: rows.rows.map(formatPromoCode) });
   } catch (error) {
     next(error);
   }
 };
 
-export const claimPromoCode = (req, res, next) => {
+export const claimPromoCode = async (req, res, next) => {
   try {
     const userId = req.user?.id ? String(req.user.id) : '';
     if (!userId) {
@@ -284,63 +286,63 @@ export const claimPromoCode = (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Enter a valid promo code to claim.' });
     }
 
-    const result = db().transaction(() => {
-      const row = db().prepare('SELECT * FROM promo_codes WHERE code = ?').get(code);
-      if (!row) {
-        const error = new Error('That promo code does not exist or is no longer active.');
-        error.statusCode = 404;
-        throw error;
-      }
-      if (row.status !== 'active') {
-        const error = new Error('This promo code is no longer active.');
-        error.statusCode = 400;
-        throw error;
-      }
+    const outcome = await transaction(async () => {
+      const selected = await query('SELECT * FROM promo_codes WHERE code = ? FOR UPDATE', [code]);
+      const row = selected.rows[0];
+      if (!row) return { error: { statusCode: 404, message: 'That promo code does not exist or is no longer active.' } };
+      if (row.status !== 'active') return { error: { statusCode: 400, message: 'This promo code is no longer active.' } };
       if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) {
-        db().prepare('UPDATE promo_codes SET status = ? WHERE code_id = ?').run('expired', row.code_id);
-        const error = new Error('This promo code has expired.');
-        error.statusCode = 410;
-        throw error;
+        await query("UPDATE promo_codes SET status = 'expired', updated_at = CURRENT_TIMESTAMP::text WHERE code_id = ?", [row.code_id]);
+        return { error: { statusCode: 410, message: 'This promo code has expired.' } };
       }
-      const alreadyClaimed = db().prepare(
-        'SELECT 1 FROM promo_code_claims WHERE code_id = ? AND user_id = ?'
-      ).get(String(row.code_id), userId);
-      if (alreadyClaimed) {
-        const error = new Error('You already claimed this code.');
-        error.statusCode = 409;
-        throw error;
+      const alreadyClaimed = await query(
+        'SELECT 1 FROM promo_code_claims WHERE code_id = ? AND user_id = ?',
+        [String(row.code_id), userId],
+      );
+      if (alreadyClaimed.rowCount > 0) {
+        return { error: { statusCode: 409, message: 'You already claimed this code.' } };
       }
-      const totalClaims = Number(db().prepare(
-        'SELECT COUNT(*) AS count FROM promo_code_claims WHERE code_id = ?'
-      ).get(String(row.code_id))?.count || 0);
+      const claimCount = await query(
+        'SELECT COUNT(*) AS count FROM promo_code_claims WHERE code_id = ?',
+        [String(row.code_id)],
+      );
+      const totalClaims = Number(claimCount.rows[0]?.count || 0);
       const maxClaims = Number(row.max_claims || 0);
       if (maxClaims > 0 && totalClaims >= maxClaims) {
-        db().prepare('UPDATE promo_codes SET status = ? WHERE code_id = ?').run('expired', row.code_id);
-        const error = new Error('This promo code has reached its maximum number of claims.');
-        error.statusCode = 409;
-        throw error;
+        await query("UPDATE promo_codes SET status = 'expired', updated_at = CURRENT_TIMESTAMP::text WHERE code_id = ?", [row.code_id]);
+        return { error: { statusCode: 409, message: 'This promo code has reached its maximum number of claims.' } };
       }
 
       const amount = Number(row.amount || 0);
       const rewardType = String(row.reward_type || 'bonus');
       const claimId = randomUUID();
       const claimedAt = new Date().toISOString();
-      db().prepare(`
+      await query(`
         INSERT INTO promo_code_claims (claim_id, code_id, user_id, code, amount, reward_type, claimed_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(claimId, row.code_id, userId, row.code, amount, rewardType, claimedAt);
-      rewardWalletEntry(userId, amount, rewardType, row.code, row.title ? `${row.title} reward` : 'Promo code reward');
+      `, [claimId, row.code_id, userId, row.code, amount, rewardType, claimedAt]);
+      if (!await rewardWalletEntry(userId, amount, rewardType, row.code, row.title ? `${row.title} reward` : 'Promo code reward')) {
+        throw new Error('The promo reward could not be recorded.');
+      }
       return {
-        id: claimId,
-        code: row.code,
-        title: row.title || 'Promo reward',
-        amount,
-        rewardType,
-        claimedAt,
+        result: {
+          id: claimId,
+          code: row.code,
+          title: row.title || 'Promo reward',
+          amount,
+          rewardType,
+          claimedAt,
+        },
       };
-    })();
+    });
+    if (outcome.error) {
+      return res.status(outcome.error.statusCode).json({ success: false, message: outcome.error.message });
+    }
 
-    const rewardLabel = result.rewardType === 'coin' ? `${Number(result.amount).toLocaleString()} coins` : `ETB ${Number(result.amount || 0).toFixed(2)}`;
+    const result = outcome.result;
+    const rewardLabel = result.rewardType === 'coin'
+      ? `${Number(result.amount).toLocaleString()} coins`
+      : `ETB ${Number(result.amount || 0).toFixed(2)}`;
     json(res, {
       claimed: result,
       message: result.rewardType === 'coin'
@@ -348,7 +350,12 @@ export const claimPromoCode = (req, res, next) => {
         : `Promo code ${result.code} accepted. You received ${rewardLabel} in your ${result.rewardType === 'real' ? 'real' : 'bonus'} wallet.`,
     });
   } catch (error) {
-    const status = error.statusCode || 500;
-    res.status(status).json({ success: false, message: error.message || 'Your promo code could not be claimed.' });
+    if (error.code === '23505') {
+      return res.status(409).json({ success: false, message: 'You already claimed this code.' });
+    }
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ success: false, message: error.message });
+    }
+    next(error);
   }
 };
