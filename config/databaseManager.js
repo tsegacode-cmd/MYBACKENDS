@@ -82,7 +82,7 @@ export const getPostgreSQLPool = () => {
   return postgresPool;
 };
 
-// Compatibility wrapper: returns PostgreSQL pool so legacy getMongoDB calls won't break
+// Compatibility wrappers so other files (like autoMigrate.js) won't crash
 export const getMongoDB = () => {
   if (!postgresPool) {
     throw new Error('PostgreSQL not initialized.');
@@ -90,8 +90,20 @@ export const getMongoDB = () => {
   return postgresPool;
 };
 
+export const getRawSQLiteDB = () => {
+  throw new Error('SQLite is no longer supported. Using Neon PostgreSQL.');
+};
+
+export const getMySQLPool = () => {
+  throw new Error('MySQL is not used. Using Neon PostgreSQL.');
+};
+
 export const isMongoDBAvailable = () => {
   return connectionStatus.postgresql.connected && postgresPool !== null;
+};
+
+export const isMySQLAvailable = () => {
+  return false;
 };
 
 export const autoFixDatabaseConnection = async () => {
@@ -144,7 +156,10 @@ export default {
   getActiveDB,
   getPostgreSQLPool,
   getMongoDB,
+  getRawSQLiteDB,
+  getMySQLPool,
   isMongoDBAvailable,
+  isMySQLAvailable,
   closeAllConnections,
   initializeDatabases
 };
