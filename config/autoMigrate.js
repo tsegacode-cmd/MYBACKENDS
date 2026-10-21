@@ -1,12 +1,68 @@
 import { getRawSQLiteDB } from './databaseManager.js';
+import { queryNeon } from './neonDatabase.js';
 import bcrypt from 'bcryptjs';
+
+const migrateRootUserToNeon = async () => {
+  if (!process.env.DATABASE_URL) return;
+
+  const rootUsername = process.env.ROOT_USERNAME?.trim() || 'root';
+  const rootPassword = process.env.ROOT_PASSWORD;
+
+  if (!rootPassword) {
+    console.warn('⚠️ ROOT_PASSWORD is not configured for Neon; skipping');
+    return;
+  }
+
+  try {
+    // Ensure users table exists in Neon PostgreSQL
+    await queryNeon(`
+      CREATE TABLE IF NOT EXISTS users (
+        _id SERIAL PRIMARY KEY,
+        username VARCHAR(255) UNIQUE NOT NULL,
+        email VARCHAR(255),
+        password_hash TEXT NOT NULL,
+        full_name VARCHAR(255),
+        role VARCHAR(50) DEFAULT 'user',
+        permissions TEXT,
+        position VARCHAR(255),
+        phone VARCHAR(50),
+        is_active INTEGER DEFAULT 1,
+        last_login TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    const passwordHash = bcrypt.hashSync(rootPassword, 10);
+    
+    // Check if root user exists
+    const { rows: existing } = await queryNeon('SELECT _id FROM users WHERE LOWER(username) = LOWER(?)', [rootUsername]);
+
+    if (existing.length > 0) {
+      await queryNeon(`
+        UPDATE users 
+        SET password_hash = ?, role = 'admin', is_active = 1, updated_at = CURRENT_TIMESTAMP
+        WHERE LOWER(username) = LOWER(?)
+      `, [passwordHash, rootUsername]);
+    } else {
+      await queryNeon(`
+        INSERT INTO users (username, password_hash, full_name, role, position, is_active)
+        VALUES (?, ?, 'Root Administrator', 'admin', 'System Administrator', 1)
+      `, [rootUsername, passwordHash]);
+    }
+
+    console.log('   ✅ Root administrator synchronized to Neon PostgreSQL');
+  } catch (error) {
+    console.error('   ❌ Failed to sync root user to Neon:', error.message);
+  }
+};
 
 const migrateRootUser = (db) => {
   const rootUsername = process.env.ROOT_USERNAME?.trim() || 'root';
   const rootPassword = process.env.ROOT_PASSWORD;
 
   if (!rootPassword) {
-    console.warn('⚠️  ROOT_PASSWORD is not configured; skipping root-user credential migration');
+    console.warn('⚠️ ROOT_PASSWORD is not configured; skipping root-user credential migration');
     return;
   }
 
@@ -21,33 +77,34 @@ const migrateRootUser = (db) => {
       updated_at = CURRENT_TIMESTAMP
   `).run(rootUsername, passwordHash);
 
-  console.log('   ✅ Root administrator credentials synchronized from environment');
+  console.log('   ✅ Root administrator credentials synchronized from environment (SQLite)');
 };
 
 /**
  * Auto-migrate database schema on server startup
- * Adds missing columns to existing tables
  */
-export const autoMigrateDatabase = () => {
+export const autoMigrateDatabase = async () => {
   console.log('🔄 Running auto-migration...');
   
   try {
+    // Sync to Neon PostgreSQL as well
+    await migrateRootUserToNeon();
+
     const db = getRawSQLiteDB();
     
     if (!db) {
-      console.log('⚠️  Database not available, skipping migration');
+      console.log('⚠️ Database not available, skipping SQLite migration');
       return false;
     }
 
     migrateRootUser(db);
 
-    // Get existing columns
+    // Get existing columns for SQLite
     const tableInfo = db.prepare('PRAGMA table_info(data_registrations)').all();
     const existingColumns = new Set(tableInfo.map(col => col.name));
     
     console.log(`   Found ${existingColumns.size} existing columns`);
 
-    // Define new columns to add
     const newColumns = [
       { name: 'city', type: 'TEXT', default: "'Harar'" },
       { name: 'address', type: 'TEXT', default: 'NULL' },
@@ -67,7 +124,6 @@ export const autoMigrateDatabase = () => {
     let addedCount = 0;
     let skippedCount = 0;
 
-    // Add missing columns
     for (const column of newColumns) {
       if (!existingColumns.has(column.name)) {
         try {
@@ -81,29 +137,6 @@ export const autoMigrateDatabase = () => {
       } else {
         skippedCount++;
       }
-    }
-
-    const projectTitleSetting = db.prepare(
-      'SELECT configJson FROM service_payment_settings WHERE configKey = ?'
-    ).get('ebc_project_title_settings');
-    let defaultProjectTitle = 'EBC LICENCE FEE';
-    if (projectTitleSetting?.configJson) {
-      try {
-        const savedSettings = JSON.parse(projectTitleSetting.configJson);
-        if (typeof savedSettings.defaultTitle === 'string' && savedSettings.defaultTitle.trim()) {
-          defaultProjectTitle = savedSettings.defaultTitle.trim();
-        }
-      } catch (error) {
-        console.error('❌ Could not read saved project title settings for registration migration:', error.message);
-      }
-    }
-    const backfillResult = db.prepare(`
-      UPDATE data_registrations
-      SET project_title = ?
-      WHERE round = 1 AND (project_title IS NULL OR TRIM(project_title) = '')
-    `).run(defaultProjectTitle);
-    if (backfillResult.changes > 0) {
-      console.log(`   ✅ Restored project title on ${backfillResult.changes} Round 1 registrations`);
     }
 
     db.exec(`
@@ -130,12 +163,7 @@ export const autoMigrateDatabase = () => {
       )
     `);
 
-    if (addedCount > 0) {
-      console.log(`✅ Auto-migration completed: ${addedCount} columns added, ${skippedCount} already existed`);
-    } else {
-      console.log(`✅ Database schema is up to date (${skippedCount} columns checked)`);
-    }
-
+    console.log(`✅ Auto-migration completed successfully`);
     return true;
   } catch (error) {
     console.error('❌ Auto-migration failed:', error.message);
