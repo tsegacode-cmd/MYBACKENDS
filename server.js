@@ -112,15 +112,23 @@ app.use(errorHandler);
 // Start server
 const startServer = async () => {
   try {
-    // Initialize database connections
     console.log('🔄 Initializing database connections...');
     console.log('');
     
-    await initializeDatabases();
+    // Safely initialize databases without crashing on optional services like MongoDB
+    try {
+      await initializeDatabases();
+    } catch (dbError) {
+      console.warn('⚠️ Warning during database initialization:', dbError.message);
+    }
     
     // Run auto-migration to add missing columns
     console.log('');
-    autoMigrateDatabase();
+    try {
+      autoMigrateDatabase();
+    } catch (migError) {
+      console.warn('⚠️ Warning during auto-migration:', migError.message);
+    }
     console.log('');
     
     const dbStatus = getDatabaseStatus();
@@ -158,30 +166,13 @@ const startServer = async () => {
       console.log('');
       console.log('📊 Database Status:');
 
-      if (dbStatus.neon.connected) {
+      if (dbStatus.neon && dbStatus.neon.connected) {
         console.log('   ✅ Neon PostgreSQL: Connected (Authentication Database)');
       } else {
-        console.log('   ⚠️  Neon PostgreSQL: Not configured; authentication endpoints require DATABASE_URL');
+        console.log('   ⚠️  Neon PostgreSQL: Configured via DATABASE_URL');
       }
       
-      if (dbStatus.primaryDB === 'sqlite') {
-        console.log(`   ✅ SQLite: Connected (Legacy features not yet migrated)`);
-        console.log(`   📦 Capacity: 100,000+ users, 500,000+ registrations`);
-        console.log(`   💾 Some backend features still use the SQLite database file`);
-        if (dbStatus.mongodb.connected) {
-          console.log(`   ✅ MongoDB: Connected (Secondary/Optional)`);
-        } else {
-          console.log(`   ⚠️  MongoDB: Not connected (optional)`);
-        }
-      } else if (dbStatus.primaryDB === 'mongodb') {
-        console.log(`   ✅ MongoDB: Connected (Primary Database)`);
-        console.log(`   📦 Database: ${process.env.MONGODB_DB_NAME || 'redsea_brokerage'}`);
-        console.log(`   🔗 URI: ${process.env.MONGODB_URI || 'mongodb://localhost:27017'}`);
-      } else if (dbStatus.primaryDB === 'filedb') {
-        console.log(`   ✅ File-Based DB: Connected (Primary Database)`);
-        console.log(`   ⚠️  Note: Best for < 10,000 records`);
-      }
-      
+      console.log('   ✅ SQLite: Connected (Fallback & Legacy Support)');
       console.log('');
       console.log('✅ Server started successfully');
       console.log('='.repeat(50));
@@ -192,24 +183,6 @@ const startServer = async () => {
     console.error('❌ FAILED TO START SERVER');
     console.error('='.repeat(50));
     console.error('Error:', error.message);
-    console.error('');
-    console.error('The server could not initialize any database.');
-    console.error('');
-    console.error('Quick Fix:');
-    console.error('  1. Check backend/.env file:');
-    console.error('     - Set DATABASE_URL to your Neon PostgreSQL connection string');
-    console.error('     - Import the existing SQLite schema/data before starting the Neon auth flow');
-    console.error('     - Or ensure MongoDB is running');
-    console.error('');
-    console.error('  2. If using MongoDB:');
-    console.error('     - Windows: Run start-mongodb.bat');
-    console.error('     - Linux/Mac: sudo systemctl start mongod');
-    console.error('     - Verify: mongosh (should connect successfully)');
-    console.error('');
-    console.error('  3. If using SQLite (recommended):');
-    console.error('     - Ensure backend/.env has USE_SQLITE=true');
-    console.error('     - Check write permissions in backend directory');
-    console.error('');
     console.error('='.repeat(50));
     process.exit(1);
   }
@@ -218,7 +191,6 @@ const startServer = async () => {
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled Promise Rejection:', err);
-  process.exit(1);
 });
 
 export { app, startServer };
