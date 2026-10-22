@@ -1,0 +1,536 @@
+import { queryNeon, withNeonTransaction } from '../config/neonDatabase.js';
+
+const queryRows = async (sql, params = []) => (await queryNeon(sql, params)).rows;
+const ensureNationalIdColumn = async () => {
+  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS national_id TEXT');
+};
+
+const PROJECT_TITLE_SETTINGS_KEY = 'ebc_project_title_settings';
+const MAX_PDF_BYTES = 4 * 1024 * 1024;
+const MAX_REGISTRATION_IMAGE_BYTES = 2 * 1024 * 1024;
+
+const isValidPdfDataUrl = value => {
+  if (value == null || value === '') return true;
+  if (typeof value !== 'string') return false;
+  const match = value.match(/^data:application\/pdf;base64,([A-Za-z0-9+/]+={0,2})$/);
+  if (!match || Math.floor(match[1].length * 3 / 4) > MAX_PDF_BYTES) return false;
+  return Buffer.from(match[1], 'base64').subarray(0, 5).toString('ascii') === '%PDF-';
+};
+
+const isValidRegistrationImageDataUrl = value => {
+  if (value == null || value === '') return true;
+  if (typeof value !== 'string') return false;
+  const match = value.match(/^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/i);
+  if (!match) return false;
+  const imageBytes = Buffer.from(match[2], 'base64');
+  if (imageBytes.length > MAX_REGISTRATION_IMAGE_BYTES) return false;
+
+  switch (match[1].toLowerCase()) {
+    case 'jpeg':
+      return imageBytes.length >= 3 && imageBytes[0] === 0xff && imageBytes[1] === 0xd8 && imageBytes[2] === 0xff;
+    case 'png':
+      return imageBytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    case 'webp':
+      return imageBytes.length >= 12 &&
+        imageBytes.subarray(0, 4).toString('ascii') === 'RIFF' &&
+        imageBytes.subarray(8, 12).toString('ascii') === 'WEBP';
+    default:
+      return false;
+  }
+};
+
+const saveRegistrationImage = async (client, registrationId, imageData) => {
+  if (imageData) {
+    await client.query(`
+      INSERT INTO registration_image_documents (registration_id, image_data, updated_at)
+      VALUES ($1, $2, $3)
+      ON CONFLICT(registration_id) DO UPDATE SET image_data = excluded.image_data, updated_at = excluded.updated_at
+    `, [registrationId, imageData, new Date().toISOString()]);
+  } else {
+    await client.query('DELETE FROM registration_image_documents WHERE registration_id = $1', [registrationId]);
+  }
+};
+
+export const getProjectDocuments = async (req, res, next) => {
+  try {
+    const documents = await queryRows('SELECT project_title, pdf_data FROM project_documents ORDER BY project_title');
+    return res.json({ success: true, data: documents });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+export const getBankReceiptDocument = async (req, res, next) => {
+  try {
+    const [row] = await queryRows('SELECT pdf_data FROM bank_receipt_documents WHERE registration_id = $1', [req.params.id]);
+    return res.json({ success: true, data: row?.pdf_data || null });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+export const getOwnerReceiptDocument = async (req, res, next) => {
+  try {
+    const [row] = await queryRows('SELECT pdf_data FROM owner_receipt_documents WHERE registration_id = $1', [req.params.id]);
+    return res.json({ success: true, data: row?.pdf_data || null });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const saveRegistrationDocument = async (client, table, id, pdfData) => {
+  if (!['bank_receipt_documents', 'owner_receipt_documents'].includes(table)) {
+    throw new Error('Unsupported registration document table.');
+  }
+  if (pdfData) {
+    await client.query(`
+      INSERT INTO ${table} (registration_id, pdf_data, updated_at)
+      VALUES ($1, $2, $3)
+      ON CONFLICT(registration_id) DO UPDATE SET pdf_data = excluded.pdf_data, updated_at = excluded.updated_at
+    `, [id, pdfData, new Date().toISOString()]);
+  } else {
+    await client.query(`DELETE FROM ${table} WHERE registration_id = $1`, [id]);
+  }
+};
+
+export const saveProjectDocument = async (req, res, next) => {
+  try {
+    const projectTitle = String(req.params.title || '').trim();
+    const pdfData = req.body?.pdf_data;
+    if (!projectTitle || projectTitle.length > 200 || !isValidPdfDataUrl(pdfData) || !pdfData) {
+      return res.status(400).json({ success: false, message: 'Provide a project title and a PDF file no larger than 4 MB.' });
+    }
+    await queryNeon(`
+      INSERT INTO project_documents (project_title, pdf_data, updated_at)
+      VALUES ($1, $2, $3)
+      ON CONFLICT(project_title) DO UPDATE SET pdf_data = excluded.pdf_data, updated_at = excluded.updated_at
+    `, [projectTitle, pdfData, new Date().toISOString()]);
+    return res.json({ success: true, data: { project_title: projectTitle, pdf_data: pdfData } });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+export const deleteProjectDocument = async (req, res, next) => {
+  try {
+    await queryNeon('DELETE FROM project_documents WHERE project_title = $1', [String(req.params.title || '').trim()]);
+    return res.json({ success: true });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+export const getProjectTitleSettings = async (_req, res, next) => {
+  try {
+    const [row] = await queryRows('SELECT configjson FROM service_payment_settings WHERE configkey = $1', [PROJECT_TITLE_SETTINGS_KEY]);
+    const settings = row ? JSON.parse(row.configjson) : { titles: [], defaultTitle: '' };
+    return res.json({ success: true, data: settings });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+export const saveProjectTitleSettings = async (req, res, next) => {
+  try {
+    const { titles, defaultTitle } = req.body || {};
+    if (
+      !Array.isArray(titles) ||
+      titles.length > 200 ||
+      titles.some(title => typeof title !== 'string' || !title.trim() || title.trim().length > 200) ||
+      typeof defaultTitle !== 'string' ||
+      (defaultTitle && !titles.some(title => title.trim() === defaultTitle.trim()))
+    ) {
+      return res.status(400).json({ success: false, message: 'Provide a valid project title list and a default title from that list.' });
+    }
+
+    const normalizedTitles = [...new Set(titles.map(title => title.trim()))];
+    const normalizedDefault = defaultTitle.trim();
+    const settings = {
+      titles: normalizedTitles,
+      defaultTitle: normalizedTitles.includes(normalizedDefault) ? normalizedDefault : (normalizedTitles[0] || ''),
+    };
+    await withNeonTransaction(async client => {
+      await client.query(`
+        INSERT INTO service_payment_settings (configkey, configjson, updatedat)
+        VALUES ($1, $2, $3)
+        ON CONFLICT(configkey) DO UPDATE SET configjson = excluded.configjson, updatedat = excluded.updatedat
+      `, [PROJECT_TITLE_SETTINGS_KEY, JSON.stringify(settings), new Date().toISOString()]);
+      if (normalizedTitles.length > 0) {
+        await client.query('DELETE FROM project_documents WHERE NOT (project_title = ANY($1::text[]))', [normalizedTitles]);
+      } else {
+        await client.query('DELETE FROM project_documents');
+      }
+    });
+
+    return res.json({ success: true, data: settings });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+// Get all data registrations
+export const getAllRegistrations = async (req, res, next) => {
+  try {
+    const registrations = await queryRows(`
+      SELECT registration.*,
+        EXISTS (
+          SELECT 1 FROM registration_image_documents image
+          WHERE image.registration_id = registration._id
+        ) AS has_registration_image
+      FROM data_registrations registration
+      ORDER BY registration.created_at DESC
+    `);
+    
+    // Convert _id to id for frontend compatibility
+    const formattedRegistrations = registrations.map(reg => ({
+      ...reg,
+      id: reg._id,
+      has_registration_image: Boolean(reg.has_registration_image)
+    }));
+
+    res.json({
+      success: true,
+      data: formattedRegistrations
+    });
+  } catch (error) {
+    console.error('Failed to get registrations:', error);
+    next(error);
+  }
+};
+
+// Get single registration by ID
+export const getRegistrationById = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const [registration] = await queryRows('SELECT * FROM data_registrations WHERE _id = $1', [id]);
+
+    if (!registration) {
+      return res.status(404).json({
+        success: false,
+        message: 'Registration not found'
+      });
+    }
+
+    const [image] = await queryRows('SELECT 1 FROM registration_image_documents WHERE registration_id = $1', [id]);
+    const [bankReceipt] = await queryRows('SELECT pdf_data FROM bank_receipt_documents WHERE registration_id = $1', [id]);
+    res.json({
+      success: true,
+      data: {
+        ...registration,
+        id: registration._id,
+        has_registration_image: Boolean(image),
+        bank_receipt_pdf: bankReceipt?.pdf_data || null
+      }
+    });
+  } catch (error) {
+    console.error('Failed to get registration:', error);
+    next(error);
+  }
+};
+
+export const getRegistrationImage = async (req, res, next) => {
+  try {
+    const [row] = await queryRows('SELECT image_data FROM registration_image_documents WHERE registration_id = $1', [req.params.id]);
+    if (!row) {
+      return res.status(404).json({ success: false, message: 'Registration image not found' });
+    }
+    return res.json({ success: true, data: row.image_data });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+// Create new data registration
+
+// Create new data registration - BULLETPROOF VERSION
+export const createRegistration = async (req, res, next) => {
+  try {
+    console.log('🔴 BULLETPROOF INSERT - Received fields:', Object.keys(req.body));
+
+    if (req.body?.national_id != null &&
+        (typeof req.body.national_id !== 'string' || req.body.national_id.trim().length > 100)) {
+      return res.status(400).json({ success: false, message: 'National ID must be text no longer than 100 characters.' });
+    }
+    await ensureNationalIdColumn();
+    const registrationRound = Number(req.body.round ?? 1);
+    if (!Number.isInteger(registrationRound) || registrationRound < 1) {
+      return res.status(400).json({ success: false, message: 'Round must be a positive whole number' });
+    }
+    if (!isValidPdfDataUrl(req.body?.bank_receipt_pdf) || !isValidPdfDataUrl(req.body?.owner_receipt_pdf)) {
+      return res.status(400).json({ success: false, message: 'Receipt attachments must be PDFs no larger than 4 MB.' });
+    }
+    if (!isValidRegistrationImageDataUrl(req.body?.registration_image)) {
+      return res.status(400).json({ success: false, message: 'Registration images must be JPEG, PNG, or WebP and no larger than 2 MB.' });
+    }
+    if (req.body?.transaction_number != null && (
+      typeof req.body.transaction_number !== 'string' || req.body.transaction_number.length > 2000
+    )) {
+      return res.status(400).json({ success: false, message: 'Transaction number must be text no longer than 2000 characters.' });
+    }
+    
+    const columnRows = await queryRows(`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema() AND table_name = 'data_registrations'
+    `);
+    const dbColumns = columnRows.map(col => col.column_name);
+    if (!dbColumns.length) throw new Error('Neon data_registrations table is missing or has no columns.');
+
+    const autoFields = ['_id', 'created_at', 'updated_at'];
+    const insertableColumns = dbColumns.filter(col => !autoFields.includes(col));
+
+    // Build data object with only insertable columns
+    const insertData = {};
+    insertableColumns.forEach(column => {
+      if (column === 'national_id') {
+        insertData[column] = req.body.national_id?.trim() || null;
+      } else if (column === 'round') {
+        insertData[column] = registrationRound;
+      } else if (req.body[column] !== undefined) {
+        insertData[column] = req.body[column];
+      } else {
+        // Set defaults for missing fields
+        switch (column) {
+          case 'work_type': insertData[column] = req.body.work_type || null; break;
+          case 'staff_id': insertData[column] = req.body.staff_id || null; break;
+          case 'staff_username': insertData[column] = req.body.staff_username || 'N/A'; break;
+          case 'staff_full_name': insertData[column] = req.body.staff_full_name || 'N/A'; break;
+          case 'client_name': insertData[column] = req.body.client_name || req.body.payer_name || ''; break;
+          case 'city': insertData[column] = req.body.city || 'Harar'; break;
+          case 'kebele': insertData[column] = req.body.kebele || ''; break;
+          case 'house_no': insertData[column] = req.body.house_no || null; break;
+          case 'receipt_no': insertData[column] = req.body.receipt_no || null; break;
+          case 'client_phone': insertData[column] = req.body.client_phone || ''; break;
+          case 'tv_no': insertData[column] = req.body.tv_no || '1'; break;
+          case 'person': insertData[column] = req.body.person || 'personal'; break;
+          case 'client_email': insertData[column] = req.body.client_email || null; break;
+          case 'condition': insertData[column] = req.body.condition || 'new'; break;
+          case 'sign': insertData[column] = req.body.sign || 'sign'; break;
+          case 'gov_letter': insertData[column] = req.body.gov_letter || 'accept'; break;
+          case 'paid_amount': insertData[column] = req.body.paid_amount || null; break;
+          case 'payment_status': insertData[column] = req.body.payment_status || 'unpaid'; break;
+          case 'round': insertData[column] = registrationRound; break;
+          case 'payment_period_type': insertData[column] = req.body.payment_period_type || '2014-2018'; break;
+          case 'payment_period_from': insertData[column] = req.body.payment_period_from || null; break;
+          case 'payment_period_to': insertData[column] = req.body.payment_period_to || null; break;
+          case 'commission_period_amount': insertData[column] = req.body.commission_period_amount || null; break;
+          case 'commission_fee': insertData[column] = req.body.commission_fee || null; break;
+          case 'commission_total': insertData[column] = req.body.commission_total || null; break;
+          case 'collected_amount': insertData[column] = req.body.collected_amount || null; break;
+          case 'registration_datetime': insertData[column] = req.body.registration_datetime || null; break;
+          case 'registered_at': insertData[column] = new Date().toISOString(); break;
+          default: insertData[column] = null;
+        }
+      }
+    });
+
+    // Validate required fields (flexible - works with client_name)
+    const nameField = insertData.client_name;
+    if (!nameField || !insertData.kebele || !insertData.client_phone) {
+      console.log('❌ Missing required fields');
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Missing required fields: Payer Name, Kebele, Client Phone',
+        debug: { 
+          client_name: nameField, 
+          kebele: insertData.kebele, 
+          client_phone: insertData.client_phone,
+          received_fields: Object.keys(req.body)
+        }
+      });
+    }
+
+    const finalColumns = Object.keys(insertData);
+    const finalValues = Object.values(insertData);
+    
+    if (finalColumns.some(column => !/^[a-z_][a-z0-9_]*$/.test(column))) {
+      throw new Error('The data_registrations schema contains an unsupported column name.');
+    }
+    const savedRegistration = await withNeonTransaction(async client => {
+      const placeholders = finalColumns.map((_, index) => `$${index + 1}`).join(', ');
+      const result = await client.query(`
+        INSERT INTO data_registrations (${finalColumns.join(', ')})
+        VALUES (${placeholders})
+        RETURNING *
+      `, finalValues);
+      const saved = result.rows[0];
+      if (req.body.bank_receipt_pdf) {
+        await saveRegistrationDocument(client, 'bank_receipt_documents', saved._id, req.body.bank_receipt_pdf);
+      }
+      if (req.body.owner_receipt_pdf) {
+        await saveRegistrationDocument(client, 'owner_receipt_documents', saved._id, req.body.owner_receipt_pdf);
+      }
+      if (req.body.registration_image) {
+        await saveRegistrationImage(client, saved._id, req.body.registration_image);
+      }
+      return saved;
+    });
+
+    if (Number(savedRegistration?.round) !== registrationRound) {
+      throw new Error(`Database saved Round ${savedRegistration?.round}; expected Round ${registrationRound}`);
+    }
+
+    console.log('✅ Registration created in Neon - ID:', savedRegistration._id, 'Round:', savedRegistration.round);
+    res.status(201).json({
+      success: true,
+      message: 'Registration created successfully',
+      data: { ...savedRegistration, id: savedRegistration._id }
+    });
+
+  } catch (error) {
+    console.error('❌ BULLETPROOF INSERT FAILED:', error);
+    res.status(500).json({ success: false, message: 'Insert failed: ' + error.message });
+  }
+};
+
+
+export const updateRegistration = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const updates = { ...req.body };
+    if (updates.national_id != null &&
+        (typeof updates.national_id !== 'string' || updates.national_id.trim().length > 100)) {
+      return res.status(400).json({ success: false, message: 'National ID must be text no longer than 100 characters.' });
+    }
+    if (typeof updates.national_id === 'string') updates.national_id = updates.national_id.trim() || null;
+    await ensureNationalIdColumn();
+    if (
+      (Object.prototype.hasOwnProperty.call(updates, 'bank_receipt_pdf') && !isValidPdfDataUrl(updates.bank_receipt_pdf)) ||
+      (Object.prototype.hasOwnProperty.call(updates, 'owner_receipt_pdf') && !isValidPdfDataUrl(updates.owner_receipt_pdf))
+    ) {
+      return res.status(400).json({ success: false, message: 'Receipt attachments must be PDFs no larger than 4 MB.' });
+    }
+    const bankReceiptPdf = updates.bank_receipt_pdf;
+    const ownerReceiptPdf = updates.owner_receipt_pdf;
+    const registrationImage = updates.registration_image;
+    if (Object.prototype.hasOwnProperty.call(updates, 'registration_image') && !isValidRegistrationImageDataUrl(registrationImage)) {
+      return res.status(400).json({ success: false, message: 'Registration images must be JPEG, PNG, or WebP and no larger than 2 MB.' });
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'transaction_number') && updates.transaction_number != null && (
+      typeof updates.transaction_number !== 'string' || updates.transaction_number.length > 2000
+    )) {
+      return res.status(400).json({ success: false, message: 'Transaction number must be text no longer than 2000 characters.' });
+    }
+    delete updates.bank_receipt_pdf;
+    delete updates.owner_receipt_pdf;
+    delete updates.registration_image;
+
+    const columnRows = await queryRows(`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema() AND table_name = 'data_registrations'
+    `);
+    const existingColumns = new Set(columnRows.map(col => col.column_name));
+    if (!existingColumns.size) throw new Error('Neon data_registrations table is missing or has no columns.');
+
+    // Filter updates to only include fields that exist in the database
+    const filteredUpdates = {};
+    const skippedFields = [];
+    
+    for (const [key, value] of Object.entries(updates)) {
+      if (existingColumns.has(key)) {
+        if (key === 'round') {
+          const registrationRound = Number(value);
+          if (!Number.isInteger(registrationRound) || registrationRound < 1) {
+            return res.status(400).json({ success: false, message: 'Round must be a positive whole number' });
+          }
+          filteredUpdates[key] = registrationRound;
+        } else {
+          filteredUpdates[key] = value;
+        }
+      } else {
+        skippedFields.push(key);
+      }
+    }
+
+    // Log skipped fields for debugging
+    if (skippedFields.length > 0) {
+      console.log(`Skipped non-existent columns: ${skippedFields.join(', ')}`);
+    }
+
+    if (!Object.keys(filteredUpdates).length && bankReceiptPdf === undefined &&
+        ownerReceiptPdf === undefined && registrationImage === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: 'No valid fields to update'
+      });
+    }
+
+    if (Object.keys(filteredUpdates).some(key => !/^[a-z_][a-z0-9_]*$/.test(key))) {
+      throw new Error('The data_registrations schema contains an unsupported column name.');
+    }
+    const updatedRegistration = await withNeonTransaction(async client => {
+      const updateEntries = Object.entries(filteredUpdates);
+      if (updateEntries.length) {
+        const assignments = updateEntries.map(([key], index) => `${key} = $${index + 1}`);
+        const values = updateEntries.map(([, value]) => value);
+        assignments.push(`updated_at = CURRENT_TIMESTAMP::text`);
+        const updated = await client.query(`
+          UPDATE data_registrations SET ${assignments.join(', ')}
+          WHERE _id = $${values.length + 1}
+          RETURNING *
+        `, [...values, id]);
+        if (!updated.rowCount) return null;
+      }
+      const [existing] = (await client.query(
+        'SELECT _id FROM data_registrations WHERE _id = $1 FOR UPDATE',
+        [id]
+      )).rows;
+      if (!existing) return null;
+
+      if (bankReceiptPdf !== undefined) {
+        await saveRegistrationDocument(client, 'bank_receipt_documents', id, bankReceiptPdf);
+      }
+      if (ownerReceiptPdf !== undefined) {
+        await saveRegistrationDocument(client, 'owner_receipt_documents', id, ownerReceiptPdf);
+      }
+      if (registrationImage !== undefined) {
+        await saveRegistrationImage(client, id, registrationImage);
+      }
+      return (await client.query('SELECT * FROM data_registrations WHERE _id = $1', [id])).rows[0];
+    });
+    if (!updatedRegistration) {
+      return res.status(404).json({
+        success: false,
+        message: 'Registration not found'
+      });
+    }
+    res.json({
+      success: true,
+      message: 'Registration updated successfully',
+      data: { ...updatedRegistration, id: updatedRegistration._id },
+      skippedFields: skippedFields.length > 0 ? skippedFields : undefined
+    });
+  } catch (error) {
+    console.error('Failed to update registration:', error);
+    next(error);
+  }
+};
+
+// Delete data registration
+export const deleteRegistration = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const deleted = await withNeonTransaction(async client => {
+      const [existing] = (await client.query('SELECT _id FROM data_registrations WHERE _id = $1 FOR UPDATE', [id])).rows;
+      if (!existing) return false;
+      await client.query('DELETE FROM bank_receipt_documents WHERE registration_id = $1', [id]);
+      await client.query('DELETE FROM owner_receipt_documents WHERE registration_id = $1', [id]);
+      await client.query('DELETE FROM registration_image_documents WHERE registration_id = $1', [id]);
+      const result = await client.query('DELETE FROM data_registrations WHERE _id = $1', [id]);
+      return result.rowCount === 1;
+    });
+    if (!deleted) {
+      return res.status(404).json({
+        success: false,
+        message: 'Registration not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Registration deleted successfully'
+    });
+  } catch (error) {
+    console.error('Failed to delete registration:', error);
+    next(error);
+  }
+};
