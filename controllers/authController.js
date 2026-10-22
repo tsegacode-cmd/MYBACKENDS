@@ -1,5 +1,6 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { getDatabaseStatus } from '../config/databaseManager.js';
 import { queryNeon } from '../config/neonDatabase.js';
 import { awardDailyLoginCoins } from './socialController.js';
 
@@ -75,9 +76,11 @@ export const login = async (req, res, next) => {
       });
     }
 
-    // Update last login
-    await queryNeon('UPDATE users SET last_login = CURRENT_TIMESTAMP::text WHERE _id = ?', [user.id]);
-    await awardDailyLoginCoins(user.id);
+    // Update last login (Fixed: removed ::text casting for PostgreSQL timestamp compatibility)
+    await queryNeon('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE _id = ?', [user.id]);
+    if (getDatabaseStatus().sqlite.connected) {
+      awardDailyLoginCoins(user.id);
+    }
 
     // Generate JWT token
     const token = jwt.sign(
@@ -162,7 +165,7 @@ export const updateProfile = async (req, res, next) => {
 
     values.push(req.user.id);
 
-    const sql = `UPDATE users SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP::text WHERE _id = ?`;
+    const sql = `UPDATE users SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE _id = ?`;
     await queryNeon(sql, values);
 
     res.json({
@@ -219,7 +222,7 @@ export const changePassword = async (req, res, next) => {
 
     // Update password
     await queryNeon(
-      'UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP::text WHERE _id = ?',
+      'UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE _id = ?',
       [hashedPassword, req.user.id]
     );
 
@@ -269,7 +272,10 @@ export const rootLogin = async (req, res, next) => {
       isRoot: true
     }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
     delete user.password_hash;
-    await queryNeon('UPDATE users SET last_login = CURRENT_TIMESTAMP::text WHERE _id = ?', [user.id]);
+    
+    // Fixed: removed ::text casting
+    await queryNeon('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE _id = ?', [user.id]);
+    
     return res.json({
       success: true,
       message: 'Root login successful.',
