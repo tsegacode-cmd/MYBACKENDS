@@ -67,7 +67,7 @@ export const getRecentActivity = async (req, res, next) => {
     // Get recent transactions combined from fixed and movable
     const recentTransactions = await queryRows(`
       SELECT t.status, t.commission_amount AS amount, t.created_at,
-        COALESCE(NULLIF(c.company_name, ''), NULLIF(c.full_name, ''), 'Unknown') AS company_name
+        COALESCE(NULLIF(c.full_name, ''), 'Unknown') AS company_name
       FROM (
         SELECT client_id, status, commission_amount, created_at FROM fixed_transactions
         UNION ALL
@@ -103,13 +103,13 @@ export const getRecentActivity = async (req, res, next) => {
 
     // Get recent clients
     const recentClients = await queryRows(
-      'SELECT company_name, full_name, created_at FROM clients ORDER BY created_at DESC LIMIT 3'
+      'SELECT full_name, created_at FROM clients ORDER BY created_at DESC LIMIT 3'
     );
 
     recentClients.forEach(client => {
       activities.push({
         icon: '🤝',
-        text: `New partnership created with ${client.company_name || client.full_name || 'Unknown'}`,
+        text: `New partnership created with ${client.full_name || 'Unknown'}`,
         time: client.created_at,
         type: 'partner'
       });
@@ -188,7 +188,7 @@ export const getAllTransactions = async (req, res, next) => {
     }
 
     const transactions = await queryRows(`
-      SELECT t.*, c.company_name, u.full_name as user_name
+      SELECT t.*, c.full_name AS company_name, u.full_name as user_name
       FROM (
         SELECT _id, transaction_number, client_id, assigned_to AS user_id, commission_amount AS amount,
           status, transaction_date, payment_received, payment_status, created_at, 'fixed' AS category
