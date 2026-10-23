@@ -23,15 +23,24 @@ export const getDashboardStats = async (req, res, next) => {
       SELECT
         (SELECT COUNT(*) FROM clients WHERE status = 'active') AS active_clients,
         (SELECT COUNT(*) FROM brokerage_contracts WHERE status = 'active') AS active_contracts,
-        (SELECT COUNT(*) FROM fixed_transactions WHERE status IN ('pending', 'in_progress')) +
-          (SELECT COUNT(*) FROM movable_transactions WHERE status IN ('pending', 'in_progress')) AS pending_transactions,
+        (
+          (SELECT COUNT(*) FROM fixed_transactions WHERE status IN ('pending', 'in_progress')) +
+          (SELECT COUNT(*) FROM movable_transactions WHERE status IN ('pending', 'in_progress'))
+        ) AS pending_transactions,
         (SELECT COUNT(*) FROM contact_inquiries WHERE status IN ('new', 'in_progress')) AS pending_inquiries,
-        (SELECT COALESCE(SUM(commission_amount - payment_received), 0) FROM fixed_transactions WHERE payment_status <> 'paid') +
-          (SELECT COALESCE(SUM(commission_amount - payment_received), 0) FROM movable_transactions WHERE payment_status <> 'paid') AS total_pending_payments,
-        (SELECT COALESCE(SUM(commission_amount), 0) FROM fixed_transactions WHERE status = 'completed' AND NULLIF(transaction_date, '')::timestamp >= date_trunc('month', CURRENT_TIMESTAMP) AND NULLIF(transaction_date, '')::timestamp < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month') +
-          (SELECT COALESCE(SUM(commission_amount), 0) FROM movable_transactions WHERE status = 'completed' AND NULLIF(transaction_date, '')::timestamp >= date_trunc('month', CURRENT_TIMESTAMP) AND NULLIF(transaction_date, '')::timestamp < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month') AS current_month_revenue,
-        (SELECT COALESCE(SUM(commission_amount), 0) FROM fixed_transactions WHERE status = 'completed') +
-          (SELECT COALESCE(SUM(commission_amount), 0) FROM movable_transactions WHERE status = 'completed') AS total_revenue
+        (
+          (SELECT COALESCE(SUM(commission_amount - payment_received), 0) FROM fixed_transactions WHERE payment_status <> 'paid') +
+          (SELECT COALESCE(SUM(commission_amount - payment_received), 0) FROM movable_transactions WHERE payment_status <> 'paid')
+        ) AS total_pending_payments,
+        (
+          (SELECT COALESCE(SUM(commission_amount), 0) FROM fixed_transactions WHERE status = 'completed' AND NULLIF(transaction_date, '')::timestamp >= date_trunc('month', CURRENT_TIMESTAMP) AND NULLIF(transaction_date, '')::timestamp < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month') +
+          (SELECT COALESCE(SUM(commission_amount), 0) FROM movable_transactions WHERE status = 'completed' AND NULLIF(transaction_date, '')::timestamp >= date_trunc('month', CURRENT_TIMESTAMP) AND NULLIF(transaction_date, '')::timestamp < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month')
+        ) AS current_month_revenue,
+        (
+          (SELECT COALESCE(SUM(commission_amount), 0) FROM fixed_transactions WHERE status = 'completed') +
+          (SELECT COALESCE(SUM(commission_amount), 0) FROM movable_transactions WHERE status = 'completed')
+        ) AS total_revenue
+      FROM (SELECT 1) AS dummy_table
     `);
 
     const stats = result.rows[0] || {};
@@ -186,58 +195,4 @@ export const getServicePerformance = async (req, res, next) => {
 // Get recent activities
 export const getRecentActivities = async (req, res, next) => {
   try {
-    const requestedLimit = Number.parseInt(req.query.limit ?? 10, 10);
-    const limit = Number.isSafeInteger(requestedLimit) && requestedLimit > 0
-      ? Math.min(requestedLimit, 100)
-      : 10;
-
-    const activities = await queryRows(`
-      SELECT
-        'fixed_transaction' AS activity_type,
-        ft._id AS id,
-        ft.transaction_number AS reference,
-        c.full_name AS client_name,
-        ft.commission_amount,
-        ft.status,
-        ft.created_at
-      FROM fixed_transactions ft
-      JOIN clients c ON ft.client_id = c._id
-
-      UNION ALL
-
-      SELECT
-        'movable_transaction' AS activity_type,
-        mt._id AS id,
-        mt.transaction_number AS reference,
-        c.full_name AS client_name,
-        mt.commission_amount,
-        mt.status,
-        mt.created_at
-      FROM movable_transactions mt
-      JOIN clients c ON mt.client_id = c._id
-
-      UNION ALL
-
-      SELECT
-        'contract' AS activity_type,
-        bc._id AS id,
-        bc.contract_number AS reference,
-        c.full_name AS client_name,
-        bc.commission_amount,
-        bc.status,
-        bc.created_at
-      FROM brokerage_contracts bc
-      JOIN clients c ON bc.client_id = c._id
-
-      ORDER BY created_at DESC
-      LIMIT $1
-    `, [limit]);
-
-    res.json({
-      success: true,
-      data: activities
-    });
-  } catch (error) {
-    next(error);
-  }
-};
+    const requestedLimit = Number.
