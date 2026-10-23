@@ -231,4 +231,30 @@ export const getRecentActivities = async (req, res, next) => {
         mt.status,
         mt.created_at
       FROM movable_transactions mt
-      JOIN clients
+      JOIN clients c ON mt.client_id = c._id
+
+      UNION ALL
+
+      SELECT
+        'contract' AS activity_type,
+        bc._id AS id,
+        bc.contract_number AS reference,
+        c.full_name AS client_name,
+        bc.commission_amount,
+        bc.status,
+        bc.created_at
+      FROM brokerage_contracts bc
+      JOIN clients c ON bc.client_id = c._id
+
+      ORDER BY created_at DESC
+      LIMIT $1
+    `, [limit]);
+
+    res.json({
+      success: true,
+      data: activities
+    });
+  } catch (error) {
+    next(error);
+  }
+};
