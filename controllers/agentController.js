@@ -728,3 +728,9 @@ export const fundAgentPackagePool = async (req, res, next) => {
     next(error);
   }
 };
+
+export const getAgentPlatformAnalytics = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const totalAgents = (await db.prepare(`SELECT COUNT(*) AS count FROM users WHERE LOWER(role) = 'agent'`).get())?.count || 0;
+    const activeAgents = (await db.prepare(`SELECT COUNT(*) AS count FROM users WHERE LOWER(role) = 'agent' AND COALESCE(is_active, 1) = 1`).
