@@ -33,9 +33,9 @@ const parseProduct = (row, includeDownloadUrl = false) => {
     id: row.id,
     serviceKey: row.service_key,
     ownerProduct: Boolean(row.owner_user_id),
-    published: Boolean(row.published), // Fixed for Postgres boolean
+    published: Boolean(row.published),
     approvalStatus: row.approval_status || 'approved',
-    boosted: Boolean(row.boosted), // Fixed for Postgres boolean
+    boosted: Boolean(row.boosted),
   };
 };
 
@@ -131,12 +131,7 @@ export const getMarketplaceProducts = async (req, res, next) => {
       ORDER BY b.updated_at DESC
     `);
     const boostedPosts = boostedRows.map(post => ({
-      id: `boosted-${post.post_id}`,
-      title: post.product_name || post.content?.trim().slice(0, 100) || 'Boosted post',
-      name: post.product_name || post.content?.trim().slice(0, 100) || 'Boosted post',
-      price: post.product_price,
-      image: post.product_image,
-      productUrl: post.product_url || `/feed?post=${encodeURIComponent(post.post_id)}`,
+      id: `boosted-${post.post_id}`, title: post.product_name \vert{}\vert{} post.content?.trim().slice(0, 100) \vert{}\vert{} 'Boosted post', name: post.product_name \vert{}\vert{} post.content?.trim().slice(0, 100) \vert{}\vert{} 'Boosted post', price: post.product_price, image: post.product_image, productUrl: post.product_url \vert{}\vert{} `/feed?post=${encodeURIComponent(post.post_id)}`,
       organizationName: post.provider,
       description: post.content,
       category: 'Boosted product',
@@ -229,4 +224,158 @@ export const getMarketplaceBookingDetails = async (itemId, paymentType) => {
   `, [String(itemId || '')]);
   const row = rows[0];
   if (!row) throw new Error('This product is no longer available for wallet booking.');
-  if (!row.published) throw new Error('This product is no longer available
+  if (!row.published) throw new Error('This product is no longer available.');
+
+  const product = JSON.parse(row.product_json);
+  const options = product.paymentOptions || {};
+  const option = options[paymentType];
+  if (product.digitalProduct && paymentType !== 'fullPayment') {
+    throw new Error('Digital products require full payment before the download can be delivered.');
+  }
+  if (!['serviceCharge', 'firstPayment', 'fullPayment'].includes(paymentType) ||
+      (option && option.enabled === false) ||
+      (options.fullPayment?.required && paymentType !== 'fullPayment')) {
+    throw new Error('The selected payment option is not available for this product.');
+  }
+
+  const rawBaseAmount = paymentType === 'fullPayment'
+    ? (option?.amount || product.price)
+    : option?.amount;
+  const productAmount = Math.round(Number(rawBaseAmount) * 100) / 100;
+  if (!Number.isFinite(productAmount) || productAmount <= 0) {
+    throw new Error('The selected product payment option does not have a valid amount.');
+  }
+  const platformFeePercent = row.owner_user_id ? await getPlatformFeePercent() : 0;
+  const platformServiceCharge = Math.round(productAmount * platformFeePercent) / 100;
+  const expectedAmount = Math.round((productAmount + platformServiceCharge) * 100) / 100;
+  const marketplaceSplit = row.owner_user_id ? {
+    productOwnerUserId: row.owner_user_id,
+    productAmount: productAmount.toFixed(2),
+    platformServiceCharge: platformServiceCharge.toFixed(2),
+    platformFeePercent,
+  } : null;
+  return {
+    itemId: String(itemId),
+    itemName: String(product.title || product.name || 'Service booking').trim().slice(0, 200),
+    category: String(product.category || row.service_key).trim().slice(0, 100),
+    paymentType,
+    paymentLabel: String(option?.label || paymentType).slice(0, 80),
+    amount: expectedAmount.toFixed(2),
+    productAmount: productAmount.toFixed(2),
+    platformServiceCharge: platformServiceCharge.toFixed(2),
+    platformFeePercent,
+    marketplaceSplit,
+  };
+};
+
+export const getMarketplaceSaleSplit = async (itemId, paymentType, amount) => {
+  const { rows } = await queryNeon(`
+    SELECT product_json, owner_user_id, service_key, published
+    FROM service_catalog_products
+    WHERE product_id = ?
+  `, [String(itemId || '')]);
+  const row = rows[0];
+  if (!row) {
+    if (String(itemId || '').startsWith('service-')) throw new Error('This product is no longer available.');
+    return null;
+  }
+  if (!row.published) throw new Error('This product is no longer available.');
+  if (!row.owner_user_id) return null;
+  const details = await getMarketplaceBookingDetails(itemId, paymentType);
+  if (Math.round(Number(amount) * 100) !== Math.round(Number(details.amount) * 100)) {
+    throw new Error('The booking total changed. Refresh the page and try again.');
+  }
+  return details.marketplaceSplit;
+};
+
+export const getRootMarketplaceProducts = async (req, res, next) => {
+  try {
+    const { rows } = await queryNeon(`SELECT ${PRODUCT_FIELDS} FROM service_catalog_products ORDER BY service_key, updated_at DESC`);
+    json(res, rows.map(row => parseProduct(row, true)));
+  } catch (error) { next(error); }
+};
+
+export const saveRootMarketplaceProduct = async (req, res, next) => {
+  try {
+    const product = req.body?.product;
+    const serviceKey = String(req.body?.serviceKey || '');
+    if (!SERVICE_KEYS.has(serviceKey) || !product || typeof product !== 'object' || Array.isArray(product) ||
+        typeof product.id !== 'string' || product.id.length > 100) {
+      return res.status(400).json({ success: false, message: 'A valid service category and product are required.' });
+    }
+    if (product.digitalProduct) {
+      let downloadUrl;
+      try {
+        downloadUrl = new URL(String(product.downloadUrl || ''));
+      } catch {
+        return res.status(400).json({ success: false, message: 'Digital products need a valid HTTPS download link.' });
+      }
+      if (downloadUrl.protocol !== 'https:' || String(product.downloadUrl).length > 2048) {
+        return res.status(400).json({ success: false, message: 'Digital products need a valid HTTPS download link.' });
+      }
+    }
+    let deliverySettings;
+    try {
+      deliverySettings = normalizeDeliverySettings(product);
+    } catch (error) {
+      return res.status(400).json({ success: false, message: error.message });
+    }
+    const safeProduct = { ...product };
+    safeProduct.description = String(product.description || '').trim().slice(0, 2000);
+    Object.assign(safeProduct, deliverySettings);
+    if (!safeProduct.digitalProduct) {
+      delete safeProduct.downloadUrl;
+      delete safeProduct.downloadFilename;
+    }
+    const currentResult = await queryNeon('SELECT published, boosted FROM service_catalog_products WHERE product_id = ?', [product.id]);
+    const current = currentResult.rows[0];
+    const published = current ? current.published : (product.published === false ? false : true);
+    const boosted = current ? current.boosted : false;
+    await queryNeon(`
+      INSERT INTO service_catalog_products (product_id, service_key, product_json, published, boosted, updated_at)
+      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP::text)
+      ON CONFLICT(product_id) DO UPDATE SET
+        service_key = excluded.service_key,
+        product_json = excluded.product_json,
+        updated_at = CURRENT_TIMESTAMP::text
+    `, [product.id, serviceKey, JSON.stringify(safeProduct), published, boosted]);
+    const savedResult = await queryNeon(`SELECT ${PRODUCT_FIELDS} FROM service_catalog_products WHERE product_id = ?`, [product.id]);
+    const saved = savedResult.rows[0];
+    json(res, parseProduct(saved, true), current ? 200 : 201);
+  } catch (error) { next(error); }
+};
+
+export const getMarketplaceDigitalProduct = async productId => {
+  if (!productId) return null;
+  const { rows } = await queryNeon(`
+    SELECT product_json, service_key
+    FROM service_catalog_products
+    WHERE product_id = ?
+  `, [String(productId)]);
+  const row = rows[0];
+  if (!row) return null;
+  const product = JSON.parse(row.product_json);
+  if (!product.digitalProduct || !product.downloadUrl) return null;
+  return {
+    downloadUrl: product.downloadUrl,
+    downloadFilename: product.downloadFilename || product.title || product.name || 'digital-product',
+    title: product.title || product.name || 'Digital product',
+  };
+};
+
+export const updateRootMarketplaceProduct = async (req, res, next) => {
+  try {
+    const { published, boosted } = req.body || {};
+    if (published === undefined && boosted === undefined) {
+      return res.status(400).json({ success: false, message: 'Choose whether to publish or boost this product.' });
+    }
+    if ((published !== undefined && typeof published !== 'boolean') ||
+        (boosted !== undefined && typeof boosted !== 'boolean')) {
+      return res.status(400).json({ success: false, message: 'Publish and boost values must be true or false.' });
+    }
+    const productId = String(req.params.productId);
+    const currentResult = await queryNeon('SELECT published, boosted FROM service_catalog_products WHERE product_id = ?', [productId]);
+    const current = currentResult.rows[0];
+    if (!current) return res.status(404).json({ success: false, message: 'Product not found.' });
+    await queryNeon(`
+      UPDATE service_catalog_products SET published = ?, boosted = ?, updated_at = CURRENT_TIMESTAMP::
