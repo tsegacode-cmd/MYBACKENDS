@@ -224,7 +224,7 @@ export const createAgentWalletRequest = async (req, res, next) => {
     const minimum = type === 'deposit' ? Number(settings.min_deposit) : Number(settings.min_withdrawal);
     const maximum = type === 'deposit' ? Number(settings.max_deposit) : Number(settings.max_withdrawal);
     if (amount < minimum || amount > maximum) {
-      return res.status(400).json({ success: false, message: `Amount must be between ${minimum} and${maximum} ETB` });
+      return res.status(400).json({ success: false, message: `Amount must be between ${minimum} and ${maximum} ETB` });
     }
 
     const serviceCharge = Math.round(amount * Number(agent.service_charge_percent || 0)) / 100;
@@ -286,7 +286,10 @@ export const reviewAgentWalletRequest = async (req, res, next) => {
             INSERT INTO wallet_ledger
               (entry_id, user_id, amount, entry_type, reference, description, balance_type)
             VALUES (?, ?, ?, 'agent_withdrawal', ?, ?, 'real')
-          `).run(createId(), request.user_id, -Number(request.amount), `agent-wallet:${request.request_id}:user`, 'Agent wallet withdrawal'); await recordPackageLedger( db, request.agent_user_id, -Number(request.net_amount), `agent-wallet:${request.request_id}:agent`, 'Agent withdrawal payout'
+          `).run(createId(), request.user_id, -Number(request.amount), `agent-wallet:${request.request_id}:user`, 'Agent wallet withdrawal');
+          await recordPackageLedger(
+            db, request.agent_user_id, -Number(request.net_amount),
+            `agent-wallet:${request.request_id}:agent`, 'Agent withdrawal payout'
           );
         } else {
           await db.prepare(`
@@ -690,7 +693,31 @@ export const adjustAgentWalletBalance = async (req, res, next) => {
       INSERT INTO wallet_ledger
         (entry_id, user_id, amount, entry_type, reference, description, balance_type)
       VALUES (?, ?, ?, 'admin_adjustment', ?, ?, 'real')
-    `).run(createId(), agentUserId, amount, `admin-adjust:${createId()}`, description);  res.json({ success: true, data: { agentUserId, adjustedAmount: amount } }); } catch (error) { next(error); } };  export const fundAgentPackagePool = async (req, res, next) => { try { const db = getAgentDB(); const amount = amountValue(req.body?.amount \vert{}\vert{} 0); const agentUserId = req.body?.agentUserId ? String(req.body.agentUserId) : null; const description = String(req.body?.description \vert{}\vert{} 'Pool funding').trim(); const createdBy = userId(req);  if (!isValidAmount(amount)) { return res.status(400).json({ success: false, message: 'Provide a valid positive amount' }); }  await recordPoolLedger( db, amount, agentUserId, `pool-fund:${createId()}`,
+    `).run(createId(), agentUserId, amount, `admin-adjust:${createId()}`, description);
+
+    res.json({ success: true, data: { agentUserId, adjustedAmount: amount } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const fundAgentPackagePool = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const amount = amountValue(req.body?.amount || 0);
+    const agentUserId = req.body?.agentUserId ? String(req.body.agentUserId) : null;
+    const description = String(req.body?.description || 'Pool funding').trim();
+    const createdBy = userId(req);
+
+    if (!isValidAmount(amount)) {
+      return res.status(400).json({ success: false, message: 'Provide a valid positive amount' });
+    }
+
+    await recordPoolLedger(
+      db,
+      amount,
+      agentUserId,
+      `pool-fund:${createId()}`,
       description,
       createdBy
     );
@@ -829,7 +856,16 @@ export const reviewAgentPackageRequest = async (req, res, next) => {
           db,
           -amount,
           request.agent_user_id,
-          `pool-disburse:${requestId}`, 'Agent package request disbursement', userId(req) );  await recordPackageLedger( db, request.agent_user_id, amount, `package-request:${requestId}`,
+          `pool-disburse:${requestId}`,
+          'Agent package request disbursement',
+          userId(req)
+        );
+
+        await recordPackageLedger(
+          db,
+          request.agent_user_id,
+          amount,
+          `package-request:${requestId}`,
           'Approved package request funding'
         );
       }
@@ -941,3 +977,30 @@ export const createAgentChildAccount = async (req, res, next) => {
 
     const existing = await db.prepare(`
       SELECT _id FROM users WHERE username = ? OR email = ?
+    `).get(username, email);
+
+    if (existing) {
+      return res.status(409).json({ success: false, message: 'Username or email already exists' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const newUserId = createId();
+
+    await db.prepare(`
+      INSERT INTO users (_id, username, email, password, full_name, phone, role, created_by_user_id, is_active)
+      VALUES (?, ?, ?, ?, ?, ?, 'user', ?, 1)
+    `).run(newUserId, username, email, hashedPassword, fullName, phone, parentAgentId);
+
+    res.status(201).json({
+      success: true,
+      data: {
+        id: newUserId,
+        username,
+        email,
+        fullName,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
