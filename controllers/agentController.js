@@ -1004,3 +1004,38 @@ export const createAgentChildAccount = async (req, res, next) => {
     next(error);
   }
 };
+
+export const requestAgentPackageFunds = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const agentId = userId(req);
+    const amount = amountValue(req.body?.amount || 0);
+    const note = String(req.body?.note || '').trim();
+
+    const agent = await getAgent(agentId);
+    if (!agent || !agent.is_active) {
+      return res.status(403).json({ success: false, message: 'An active agent account is required' });
+    }
+
+    if (!isValidAmount(amount)) {
+      return res.status(400).json({ success: false, message: 'Provide a valid positive amount' });
+    }
+
+    const requestId = createId();
+    await db.prepare(`
+      INSERT INTO agent_package_requests (request_id, agent_user_id, amount, note, status)
+      VALUES (?, ?, ?, ?, 'pending')
+    `).run(requestId, agentId, amount, note);
+
+    res.status(201).json({
+      success: true,
+      data: {
+        id: requestId,
+        amount,
+        status: 'pending',
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
