@@ -73,7 +73,6 @@ export const login = async (req, res, next) => {
     // Update last login
     await queryNeon('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE _id = ?', [user.id]);
     
-    // 💡 የተስተካከለ: የነበረው የ sqlite.connected ስህተት ሰራሽ ኮድ ተወግዷል
     try {
       await awardDailyLoginCoins(user.id);
     } catch (coinError) {
@@ -229,7 +228,7 @@ export const changePassword = async (req, res, next) => {
   }
 };
 
-// Root login
+// Root login (Fixed JWT sign with JWT_SECRET)
 export const rootLogin = async (req, res, next) => {
   try {
     const { username, password } = req.body;
@@ -247,6 +246,7 @@ export const rootLogin = async (req, res, next) => {
       FROM users
       WHERE LOWER(username) = LOWER(?) AND is_active = 1
     `, [String(username).trim()]);
+    
     const user = users[0];
     if (!user || !['root', 'admin'].includes(String(user.role).toLowerCase())) {
       return res.status(401).json({ success: false, message: 'Invalid root credentials.' });
@@ -257,13 +257,16 @@ export const rootLogin = async (req, res, next) => {
       return res.status(401).json({ success: false, message: 'Invalid root credentials.' });
     }
 
+    // 💡 የተስተካከለ: JWT_SECRET እና expiresIn በትክክል ተቀምጠዋል
     const token = jwt.sign({
       id: user.id,
       username: user.username,
       email: user.email,
       role: user.role,
       isRoot: true
-    }, process.env.JWT_EXPIRES_IN || '7d');
+    }, process.env.JWT_SECRET, { 
+      expiresIn: process.env.JWT_EXPIRES_IN || '7d' 
+    });
     
     delete user.password_hash;
     
