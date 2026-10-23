@@ -1,6 +1,5 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { getDatabaseStatus } from '../config/databaseManager.js';
 import { queryNeon } from '../config/neonDatabase.js';
 import { awardDailyLoginCoins } from './socialController.js';
 
@@ -20,7 +19,6 @@ export const login = async (req, res, next) => {
   try {
     const { identifier, email, password, username } = req.body;
     
-    // Accept either 'identifier' (from new login form) or 'email'/'username' (from old forms)
     const loginIdentifier = String(identifier || email || username || '').trim();
 
     console.log('=== LOGIN ATTEMPT ===');
@@ -33,7 +31,6 @@ export const login = async (req, res, next) => {
       });
     }
 
-    // Find active accounts by username, email, or phone for both staff and users.
     const sql = `
       SELECT _id as id, username, email, password_hash, full_name, role, permissions, position, phone, is_active, last_login, created_at 
       FROM users 
@@ -54,15 +51,12 @@ export const login = async (req, res, next) => {
     const user = parsePermissions(users[0]);
     console.log('User found:', user.username);
 
-    // Verify password - handle both hashed and plain text passwords
     let isPasswordValid = false;
     
     if (user.password_hash) {
-      // Try bcrypt comparison for hashed passwords
       try {
         isPasswordValid = await bcrypt.compare(password, user.password_hash);
       } catch (e) {
-        // If bcrypt fails, might be plain text
         isPasswordValid = user.password_hash === password;
       }
     }
@@ -76,10 +70,14 @@ export const login = async (req, res, next) => {
       });
     }
 
-    // Update last login (Fixed: removed ::text casting for PostgreSQL timestamp compatibility)
+    // Update last login
     await queryNeon('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE _id = ?', [user.id]);
-    if (getDatabaseStatus().sqlite.connected) {
-      awardDailyLoginCoins(user.id);
+    
+    // 💡 የተስተካከለ: የነበረው የ sqlite.connected ስህተት ሰራሽ ኮድ ተወግዷል
+    try {
+      await awardDailyLoginCoins(user.id);
+    } catch (coinError) {
+      console.error('Daily coin award notice:', coinError.message);
     }
 
     // Generate JWT token
@@ -94,7 +92,6 @@ export const login = async (req, res, next) => {
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
 
-    // Remove password from response
     delete user.password_hash;
 
     console.log('✅ Login successful for user:', user.username);
@@ -197,7 +194,6 @@ export const changePassword = async (req, res, next) => {
       });
     }
 
-    // Get current user
     const { rows: users } = await queryNeon('SELECT password_hash FROM users WHERE _id = ?', [req.user.id]);
 
     if (users.length === 0) {
@@ -207,7 +203,6 @@ export const changePassword = async (req, res, next) => {
       });
     }
 
-    // Verify current password
     const isPasswordValid = await bcrypt.compare(current_password, users[0].password_hash);
 
     if (!isPasswordValid) {
@@ -217,10 +212,8 @@ export const changePassword = async (req, res, next) => {
       });
     }
 
-    // Hash new password
     const hashedPassword = await bcrypt.hash(new_password, 10);
 
-    // Update password
     await queryNeon(
       'UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE _id = ?',
       [hashedPassword, req.user.id]
@@ -236,7 +229,7 @@ export const changePassword = async (req, res, next) => {
   }
 };
 
-// Root login (special authentication for root portal)
+// Root login
 export const rootLogin = async (req, res, next) => {
   try {
     const { username, password } = req.body;
@@ -270,10 +263,10 @@ export const rootLogin = async (req, res, next) => {
       email: user.email,
       role: user.role,
       isRoot: true
-    }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
+    }, process.env.JWT_EXPIRES_IN || '7d');
+    
     delete user.password_hash;
     
-    // Fixed: removed ::text casting
     await queryNeon('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE _id = ?', [user.id]);
     
     return res.json({
