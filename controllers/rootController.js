@@ -51,6 +51,39 @@ export const getDashboardStats = async (req, res, next) => {
   }
 };
 
+// Get dashboard status (Added to fix 500 error on dashboard-status API)
+export const getDashboardStatus = async (req, res, next) => {
+  try {
+    if (!req.user || !req.user.isRoot) {
+      return res.status(403).json({
+        success: false,
+        message: 'Root access required'
+      });
+    }
+
+    const totalUsersResult = await queryRows('SELECT COUNT(*) as count FROM users');
+    const totalUsers = Number(totalUsersResult[0]?.count || 0);
+
+    const pendingTransactionsResult = await queryRows(`
+      SELECT 
+        (SELECT COUNT(*) FROM fixed_transactions WHERE status = 'pending') +
+        (SELECT COUNT(*) FROM movable_transactions WHERE status = 'pending') as count
+    `);
+    const pendingTransactions = Number(pendingTransactionsResult[0]?.count || 0);
+
+    res.json({
+      success: true,
+      data: {
+        totalUsers,
+        pendingTransactions,
+        status: 'active'
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 // Get recent activity
 export const getRecentActivity = async (req, res, next) => {
   try {
