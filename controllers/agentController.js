@@ -775,3 +775,26 @@ export const getRootAgentDetails = async (req, res, next) => {
     next(error);
   }
 };
+
+export const getRootAgentDetailsStatus = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const agentId = String(req.params.agentId || '');
+    const agent = await getAgent(agentId);
+    if (!agent) {
+      return res.status(404).json({ success: false, message: 'Agent not found' });
+    }
+
+    const packageBalance = await getAgentPackageBalance(db, agentId);
+    res.json({
+      success: true,
+      data: {
+        id: agentId,
+        isActive: Boolean(agent.is_active),
+        packageBalance,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
