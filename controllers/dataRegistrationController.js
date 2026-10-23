@@ -65,7 +65,7 @@ const saveRegistrationImage = async (client, registrationId, imageData) => {
       ON CONFLICT(registration_id) DO UPDATE SET image_data = excluded.image_data, updated_at = excluded.updated_at
     `, [registrationId, imageData, new Date().toISOString()]);
   } else {
-    await client.query('DELETE FROM registration_image_documents WHERE registration_id = $1', [registrationId]);
+    await client.query('DELETE FROM registration_image_documents WHERE registration_id::text = $1::text', [registrationId]);
   }
 };
 
@@ -80,7 +80,7 @@ export const getProjectDocuments = async (req, res, next) => {
 
 export const getBankReceiptDocument = async (req, res, next) => {
   try {
-    const [row] = await queryRows('SELECT pdf_data FROM bank_receipt_documents WHERE registration_id = $1', [req.params.id]);
+    const [row] = await queryRows('SELECT pdf_data FROM bank_receipt_documents WHERE registration_id::text = $1::text', [req.params.id]);
     return res.json({ success: true, data: row?.pdf_data || null });
   } catch (error) {
     return next(error);
@@ -89,7 +89,7 @@ export const getBankReceiptDocument = async (req, res, next) => {
 
 export const getOwnerReceiptDocument = async (req, res, next) => {
   try {
-    const [row] = await queryRows('SELECT pdf_data FROM owner_receipt_documents WHERE registration_id = $1', [req.params.id]);
+    const [row] = await queryRows('SELECT pdf_data FROM owner_receipt_documents WHERE registration_id::text = $1::text', [req.params.id]);
     return res.json({ success: true, data: row?.pdf_data || null });
   } catch (error) {
     return next(error);
@@ -107,7 +107,7 @@ const saveRegistrationDocument = async (client, table, id, pdfData) => {
       ON CONFLICT(registration_id) DO UPDATE SET pdf_data = excluded.pdf_data, updated_at = excluded.updated_at
     `, [id, pdfData, new Date().toISOString()]);
   } else {
-    await client.query(`DELETE FROM ${table} WHERE registration_id = $1`, [id]);
+    await client.query(`DELETE FROM ${table} WHERE registration_id::text = $1::text`, [id]);
   }
 };
 
@@ -231,8 +231,8 @@ export const getRegistrationById = async (req, res, next) => {
       });
     }
 
-    const [image] = await queryRows('SELECT 1 FROM registration_image_documents WHERE registration_id = $1', [id]);
-    const [bankReceipt] = await queryRows('SELECT pdf_data FROM bank_receipt_documents WHERE registration_id = $1', [id]);
+    const [image] = await queryRows('SELECT 1 FROM registration_image_documents WHERE registration_id::text = $1::text', [id]);
+    const [bankReceipt] = await queryRows('SELECT pdf_data FROM bank_receipt_documents WHERE registration_id::text = $1::text', [id]);
     res.json({
       success: true,
       data: {
@@ -250,7 +250,7 @@ export const getRegistrationById = async (req, res, next) => {
 
 export const getRegistrationImage = async (req, res, next) => {
   try {
-    const [row] = await queryRows('SELECT image_data FROM registration_image_documents WHERE registration_id = $1', [req.params.id]);
+    const [row] = await queryRows('SELECT image_data FROM registration_image_documents WHERE registration_id::text = $1::text', [req.params.id]);
     if (!row) {
       return res.status(404).json({ success: false, message: 'Registration image not found' });
     }
@@ -532,9 +532,9 @@ export const deleteRegistration = async (req, res, next) => {
     const deleted = await withNeonTransaction(async client => {
       const [existing] = (await client.query('SELECT _id FROM data_registrations WHERE _id = $1 FOR UPDATE', [id])).rows;
       if (!existing) return false;
-      await client.query('DELETE FROM bank_receipt_documents WHERE registration_id = $1', [id]);
-      await client.query('DELETE FROM owner_receipt_documents WHERE registration_id = $1', [id]);
-      await client.query('DELETE FROM registration_image_documents WHERE registration_id = $1', [id]);
+      await client.query('DELETE FROM bank_receipt_documents WHERE registration_id::text = $1::text', [id]);
+      await client.query('DELETE FROM owner_receipt_documents WHERE registration_id::text = $1::text', [id]);
+      await client.query('DELETE FROM registration_image_documents WHERE registration_id::text = $1::text', [id]);
       const result = await client.query('DELETE FROM data_registrations WHERE _id = $1', [id]);
       return result.rowCount === 1;
     });
