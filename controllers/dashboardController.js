@@ -16,45 +16,53 @@ const normalizeNumericFields = result => {
 const queryRows = async (sql, params = []) =>
   normalizeNumericFields(await queryNeon(sql, params));
 
-// Get dashboard statistics (Fixed syntax and clean PostgreSQL structure)
+// Get dashboard statistics (Fixed with Promise.all to completely avoid syntax/parenthesis errors)
 export const getDashboardStats = async (req, res, next) => {
   try {
-    const result = await queryNeon(`
-      SELECT
-        (SELECT COUNT(*) FROM clients WHERE status = 'active') AS active_clients,
-        (SELECT COUNT(*) FROM brokerage_contracts WHERE status = 'active') AS active_contracts,
-        (
-          (SELECT COUNT(*) FROM fixed_transactions WHERE status IN ('pending', 'in_progress')) +
-          (SELECT COUNT(*) FROM movable_transactions WHERE status IN ('pending', 'in_progress'))
-        ) AS pending_transactions,
-        (SELECT COUNT(*) FROM contact_inquiries WHERE status IN ('new', 'in_progress')) AS pending_inquiries,
-        (
-          (SELECT COALESCE(SUM(commission_amount - payment_received), 0) FROM fixed_transactions WHERE payment_status <> 'paid') +
-          (SELECT COALESCE(SUM(commission_amount - payment_received), 0) FROM movable_transactions WHERE payment_status <> 'paid')
-        ) AS total_pending_payments,
-        (
-          (SELECT COALESCE(SUM(commission_amount), 0) FROM fixed_transactions WHERE status = 'completed' AND NULLIF(transaction_date, '')::timestamp >= date_trunc('month', CURRENT_TIMESTAMP) AND NULLIF(transaction_date, '')::timestamp < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month') +
-          (SELECT COALESCE(SUM(commission_amount), 0) FROM movable_transactions WHERE status = 'completed' AND NULLIF(transaction_date, '')::timestamp >= date_trunc('month', CURRENT_TIMESTAMP) AND NULLIF(transaction_date, '')::timestamp < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month')
-        ) AS current_month_revenue,
-        (
-          (SELECT COALESCE(SUM(commission_amount), 0) FROM fixed_transactions WHERE status = 'completed') +
-          (SELECT COALESCE(SUM(commission_amount), 0) FROM movable_transactions WHERE status = 'completed')
-        ) AS total_revenue
-      FROM (SELECT 1) AS dummy_table
-    `);
+    const [
+      activeClientsRes,
+      activeContractsRes,
+      pendingFixedRes,
+      pendingMovableRes,
+      pendingInquiriesRes,
+      pendingFixedPayRes,
+      pendingMovablePayRes,
+      currentMonthFixedRevRes,
+      currentMonthMovableRevRes,
+      totalFixedRevRes,
+      totalMovableRevRes
+    ] = await Promise.all([
+      queryNeon("SELECT COUNT(*) FROM clients WHERE status = 'active'"),
+      queryNeon("SELECT COUNT(*) FROM brokerage_contracts WHERE status = 'active'"),
+      queryNeon("SELECT COUNT(*) FROM fixed_transactions WHERE status IN ('pending', 'in_progress')"),
+      queryNeon("SELECT COUNT(*) FROM movable_transactions WHERE status IN ('pending', 'in_progress')"),
+      queryNeon("SELECT COUNT(*) FROM contact_inquiries WHERE status IN ('new', 'in_progress')"),
+      queryNeon("SELECT COALESCE(SUM(commission_amount - payment_received), 0) FROM fixed_transactions WHERE payment_status <> 'paid'"),
+      queryNeon("SELECT COALESCE(SUM(commission_amount - payment_received), 0) FROM movable_transactions WHERE payment_status <> 'paid'"),
+      queryNeon("SELECT COALESCE(SUM(commission_amount), 0) FROM fixed_transactions WHERE status = 'completed' AND NULLIF(transaction_date, '')::timestamp >= date_trunc('month', CURRENT_TIMESTAMP) AND NULLIF(transaction_date, '')::timestamp < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month'"),
+      queryNeon("SELECT COALESCE(SUM(commission_amount), 0) FROM movable_transactions WHERE status = 'completed' AND NULLIF(transaction_date, '')::timestamp >= date_trunc('month', CURRENT_TIMESTAMP) AND NULLIF(transaction_date, '')::timestamp < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month'"),
+      queryNeon("SELECT COALESCE(SUM(commission_amount), 0) FROM fixed_transactions WHERE status = 'completed'"),
+      queryNeon("SELECT COALESCE(SUM(commission_amount), 0) FROM movable_transactions WHERE status = 'completed'")
+    ]);
 
-    const stats = result.rows[0] || {};
+    const activeClients = Number(activeClientsRes.rows[0]?.count || 0);
+    const activeContracts = Number(activeContractsRes.rows[0]?.count || 0);
+    const pendingTransactions = Number(pendingFixedRes.rows[0]?.count || 0) + Number(pendingMovableRes.rows[0]?.count || 0);
+    const pendingInquiries = Number(pendingInquiriesRes.rows[0]?.count || 0);
+    const totalPendingPayments = Number(pendingFixedPayRes.rows[0]?.coalesce || 0) + Number(pendingMovablePayRes.rows[0]?.coalesce || 0);
+    const currentMonthRevenue = Number(currentMonthFixedRevRes.rows[0]?.coalesce || 0) + Number(currentMonthMovableRevRes.rows[0]?.coalesce || 0);
+    const totalRevenue = Number(totalFixedRevRes.rows[0]?.coalesce || 0) + Number(totalMovableRevRes.rows[0]?.coalesce || 0);
 
     res.json({
       success: true,
       data: {
-        activeClients: Number(stats.active_clients || 0),
-        activeContracts: Number(stats.active_contracts || 0),
-        pendingTransactions: Number(stats.pending_transactions || 0),
-        pendingInquiries: Number(stats.pending_inquiries || 0),
-        totalPendingPayments: Number(stats.total_pending_payments || 0),
-        currentMonthRevenue: Number(stats.current_month_revenue || 0),
-        totalRevenue: Number(stats.total_revenue || 0),
+        activeClients,
+        activeContracts,
+        pendingTransactions,
+        pendingInquiries,
+        totalPendingPayments,
+        currentMonthRevenue,
+        totalRevenue,
       }
     });
   } catch (error) {
@@ -195,4 +203,32 @@ export const getServicePerformance = async (req, res, next) => {
 // Get recent activities
 export const getRecentActivities = async (req, res, next) => {
   try {
-    const requestedLimit = Number.
+    const requestedLimit = Number.parseInt(req.query.limit ?? 10, 10);
+    const limit = Number.isSafeInteger(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 100)
+      : 10;
+
+    const activities = await queryRows(`
+      SELECT
+        'fixed_transaction' AS activity_type,
+        ft._id AS id,
+        ft.transaction_number AS reference,
+        c.full_name AS client_name,
+        ft.commission_amount,
+        ft.status,
+        ft.created_at
+      FROM fixed_transactions ft
+      JOIN clients c ON ft.client_id = c._id
+
+      UNION ALL
+
+      SELECT
+        'movable_transaction' AS activity_type,
+        mt._id AS id,
+        mt.transaction_number AS reference,
+        c.full_name AS client_name,
+        mt.commission_amount,
+        mt.status,
+        mt.created_at
+      FROM movable_transactions mt
+      JOIN clients
