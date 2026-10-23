@@ -586,4 +586,377 @@ export const createAgentCommissionRecord = async (req, res, next) => {
     const amount = amountValue(req.body?.amount || 0);
     const commissionRate = amountValue(req.body?.commissionRate || 0);
     const commissionAmount = amountValue(req.body?.commissionAmount);
-    const status = String(req.body
+    const status = String(req.body?.status || 'pending').toLowerCase();
+    const notes = String(req.body?.notes || '').trim();
+    const agent = await getAgent(agentId);
+    if (!agent || !agent.is_active) return res.status(403).json({ success: false, message: 'An active agent account is required' });
+    if (!['fixed', 'movable'].includes(commissionType) || !clientName || clientName.length > 160
+      || clientPhone.length > 30 || !assetDescription || assetDescription.length > 500
+      || location.length > 300 || !Number.isFinite(amount) || amount < 0
+      || !Number.isFinite(commissionRate) || commissionRate < 0 || commissionRate > 100
+      || !Number.isFinite(commissionAmount) || commissionAmount < 0
+      || !['pending', 'completed', 'cancelled'].includes(status) || notes.length > 2000) {
+      return res.status(400).json({ success: false, message: 'Provide valid commission details and status' });
+    }
+    const commissionId = createId();
+    await db.prepare(`
+      INSERT INTO agent_commission_records
+        (commission_id, agent_user_id, commission_type, client_name, client_phone,
+         asset_description, location, amount, commission_rate, commission_amount, status, notes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      commissionId, agentId, commissionType, clientName, clientPhone, assetDescription,
+      location, amount, commissionRate, commissionAmount, status, notes
+    );
+    res.status(201).json({ success: true, data: { id: commissionId } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const createAgentProduct = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const id = userId(req);
+    const agent = await getAgent(id);
+    const title = String(req.body?.title || '').trim();
+    const description = String(req.body?.description || '').trim();
+    const price = amountValue(req.body?.price);
+    const status = String(req.body?.status || 'selling').toLowerCase();
+    if (!agent || !agent.is_active) return res.status(403).json({ success: false, message: 'An active agent account is required' });
+    if (!title || title.length > 200 || description.length > 5000 || !isValidAmount(price)
+      || !['selling', 'buying'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Provide a valid title, description, price, and product status' });
+    }
+    const productId = createId();
+    const saveProduct = db.transaction(async () => {
+      await db.prepare(`
+        INSERT INTO agent_products (product_id, agent_user_id, title, description, price, status)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(productId, id, title, description, price, status);
+    });
+    await saveProduct();
+    res.status(201).json({ success: true, data: { id: productId } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const adjustAgentPackageBalance = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const agentUserId = String(req.body?.agentUserId || req.params?.agentId || '');
+    const amount = amountValue(req.body?.amount || 0);
+    const description = String(req.body?.description || 'Balance adjustment').trim();
+
+    if (!agentUserId || !Number.isFinite(amount) || amount === 0) {
+      return res.status(400).json({ success: false, message: 'Provide a valid agent user ID and non-zero amount' });
+    }
+
+    const agent = await getAgent(agentUserId);
+    if (!agent) {
+      return res.status(404).json({ success: false, message: 'Agent not found' });
+    }
+
+    await recordPackageLedger(
+      db, 
+      agentUserId, 
+      amount, 
+      `admin-adjust:${createId()}`, 
+      description
+    );
+
+    const newBalance = await getAgentPackageBalance(db, agentUserId);
+    res.json({ success: true, data: { agentUserId, balance: newBalance } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const adjustAgentWalletBalance = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const agentUserId = String(req.body?.agentUserId || req.params?.agentId || '');
+    const amount = amountValue(req.body?.amount || 0);
+    const description = String(req.body?.description || 'Wallet balance adjustment').trim();
+
+    if (!agentUserId || !Number.isFinite(amount) || amount === 0) {
+      return res.status(400).json({ success: false, message: 'Provide a valid agent user ID and non-zero amount' });
+    }
+
+    const agent = await getAgent(agentUserId);
+    if (!agent) {
+      return res.status(404).json({ success: false, message: 'Agent not found' });
+    }
+
+    await db.prepare(`
+      INSERT INTO wallet_ledger
+        (entry_id, user_id, amount, entry_type, reference, description, balance_type)
+      VALUES (?, ?, ?, 'admin_adjustment', ?, ?, 'real')
+    `).run(createId(), agentUserId, amount, `admin-adjust:${createId()}`, description);
+
+    res.json({ success: true, data: { agentUserId, adjustedAmount: amount } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const fundAgentPackagePool = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const amount = amountValue(req.body?.amount || 0);
+    const agentUserId = req.body?.agentUserId ? String(req.body.agentUserId) : null;
+    const description = String(req.body?.description || 'Pool funding').trim();
+    const createdBy = userId(req);
+
+    if (!isValidAmount(amount)) {
+      return res.status(400).json({ success: false, message: 'Provide a valid positive amount' });
+    }
+
+    await recordPoolLedger(
+      db,
+      amount,
+      agentUserId,
+      `pool-fund:${createId()}`,
+      description,
+      createdBy
+    );
+
+    const poolBalance = await getPackagePoolBalance(db);
+    res.json({ success: true, data: { poolBalance, addedAmount: amount } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getAgentPlatformAnalytics = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const totalAgents = (await db.prepare(`SELECT COUNT(*) AS count FROM users WHERE LOWER(role) = 'agent'`).get())?.count || 0;
+    const activeAgents = (await db.prepare(`SELECT COUNT(*) AS count FROM users WHERE LOWER(role) = 'agent' AND COALESCE(is_active, 1) = 1`).get())?.count || 0;
+    const totalPoolBalance = await getPackagePoolBalance(db);
+
+    res.json({
+      success: true,
+      data: {
+        totalAgents: Number(totalAgents),
+        activeAgents: Number(activeAgents),
+        totalPoolBalance: Number(totalPoolBalance),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getRootAgentDetails = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const agentId = String(req.params.agentId || '');
+    const agent = await getAgent(agentId);
+    if (!agent) {
+      return res.status(404).json({ success: false, message: 'Agent not found' });
+    }
+
+    const packageBalance = await getAgentPackageBalance(db, agentId);
+    const customersCount = (await db.prepare(`
+      SELECT COUNT(*) AS count FROM users WHERE created_by_user_id = ?
+    `).get(agentId))?.count || 0;
+
+    res.json({
+      success: true,
+      data: {
+        agent,
+        packageBalance,
+        customersCount: Number(customersCount),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getRootAgentDetailsStatus = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const agentId = String(req.params.agentId || '');
+    const agent = await getAgent(agentId);
+    if (!agent) {
+      return res.status(404).json({ success: false, message: 'Agent not found' });
+    }
+
+    const packageBalance = await getAgentPackageBalance(db, agentId);
+    res.json({
+      success: true,
+      data: {
+        id: agentId,
+        isActive: Boolean(agent.is_active),
+        packageBalance,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getRootAgentManagement = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const agents = await db.prepare(`
+      SELECT CAST(u._id AS TEXT) AS id, u.username, u.email, u.full_name, u.phone,
+             COALESCE(u.is_active, 1) AS is_active, u.created_at,
+             COALESCE(s.service_charge_percent, 0) AS service_charge_percent,
+             COALESCE(s.reward_percent, 0) AS reward_percent,
+             COALESCE(s.payment_details, '') AS payment_details
+      FROM users u
+      LEFT JOIN agent_settings s ON s.agent_user_id = CAST(u._id AS TEXT)
+      WHERE LOWER(u.role) = 'agent'
+      ORDER BY u.created_at DESC
+    `).all();
+    res.json({ success: true, data: agents });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const reviewAgentPackageRequest = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const requestId = String(req.params.requestId || '');
+    const status = String(req.body?.status || '').toLowerCase();
+
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Status must be approved or rejected' });
+    }
+
+    const request = await db.prepare(`
+      SELECT request_id, agent_user_id, amount, status
+      FROM agent_package_requests
+      WHERE request_id = ?
+    `).get(requestId);
+
+    if (!request) {
+      return res.status(404).json({ success: false, message: 'Package request not found' });
+    }
+
+    if (request.status !== 'pending') {
+      return res.status(409).json({ success: false, message: 'This request has already been reviewed' });
+    }
+
+    const reviewTransaction = db.transaction(async () => {
+      if (status === 'approved') {
+        const poolBalance = await getPackagePoolBalance(db);
+        const amount = Number(request.amount);
+
+        if (poolBalance < amount) {
+          throw Object.assign(new Error('Insufficient pool balance to fulfill this package request'), { status: 400 });
+        }
+
+        await recordPoolLedger(
+          db,
+          -amount,
+          request.agent_user_id,
+          `pool-disburse:${requestId}`,
+          'Agent package request disbursement',
+          userId(req)
+        );
+
+        await recordPackageLedger(
+          db,
+          request.agent_user_id,
+          amount,
+          `package-request:${requestId}`,
+          'Approved package request funding'
+        );
+      }
+
+      await db.prepare(`
+        UPDATE agent_package_requests
+        SET status = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP::text
+        WHERE request_id = ? AND status = 'pending'
+      `).run(status, userId(req), requestId);
+    });
+
+    await reviewTransaction();
+    res.json({ success: true, data: { id: requestId, status } });
+  } catch (error) {
+    if (error.status) return res.status(error.status).json({ success: false, message: error.message });
+    next(error);
+  }
+};
+
+export const reviewAgentProduct = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const productId = String(req.params.productId || '');
+    const status = String(req.body?.status || '').toLowerCase();
+
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Status must be approved or rejected' });
+    }
+
+    const product = await db.prepare(`
+      SELECT product_id, approval_status
+      FROM agent_products
+      WHERE product_id = ?
+    `).get(productId);
+
+    if (!product) {
+      return res.status(404).json({ success: false, message: 'Agent product not found' });
+    }
+
+    await db.prepare(`
+      UPDATE agent_products
+      SET approval_status = ?, updated_at = CURRENT_TIMESTAMP::text
+      WHERE product_id = ?
+    `).run(status, productId);
+
+    res.json({ success: true, data: { id: productId, status } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const updateAgentSettings = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const agentId = String(req.params.agentId || '');
+    const serviceChargePercent = Number(req.body?.serviceChargePercent ?? req.body?.service_charge_percent ?? 0);
+    const rewardPercent = Number(req.body?.rewardPercent ?? req.body?.reward_percent ?? 0);
+    const paymentDetails = String(req.body?.paymentDetails ?? req.body?.payment_details ?? '').trim();
+
+    const agent = await getAgent(agentId);
+    if (!agent) {
+      return res.status(404).json({ success: false, message: 'Agent not found' });
+    }
+
+    const existingSettings = await db.prepare(`
+      SELECT agent_user_id FROM agent_settings WHERE agent_user_id = ?
+    `).get(agentId);
+
+    if (existingSettings) {
+      await db.prepare(`
+        UPDATE agent_settings
+        SET service_charge_percent = ?, reward_percent = ?, payment_details = ?, updated_at = CURRENT_TIMESTAMP::text
+        WHERE agent_user_id = ?
+      `).run(serviceChargePercent, rewardPercent, paymentDetails, agentId);
+    } else {
+      await db.prepare(`
+        INSERT INTO agent_settings (agent_user_id, service_charge_percent, reward_percent, payment_details)
+        VALUES (?, ?, ?, ?)
+      `).run(agentId, serviceChargePercent, rewardPercent, paymentDetails);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        agentId,
+        service_charge_percent: serviceChargePercent,
+        reward_percent: rewardPercent,
+        payment_details: paymentDetails,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
