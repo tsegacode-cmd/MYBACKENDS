@@ -131,7 +131,12 @@ export const getMarketplaceProducts = async (req, res, next) => {
       ORDER BY b.updated_at DESC
     `);
     const boostedPosts = boostedRows.map(post => ({
-      id: `boosted-${post.post_id}`, title: post.product_name \vert{}\vert{} post.content?.trim().slice(0, 100) \vert{}\vert{} 'Boosted post', name: post.product_name \vert{}\vert{} post.content?.trim().slice(0, 100) \vert{}\vert{} 'Boosted post', price: post.product_price, image: post.product_image, productUrl: post.product_url \vert{}\vert{} `/feed?post=${encodeURIComponent(post.post_id)}`,
+      id: `boosted-${post.post_id}`,
+      title: post.product_name || post.content?.trim().slice(0, 100) || 'Boosted post',
+      name: post.product_name || post.content?.trim().slice(0, 100) || 'Boosted post',
+      price: post.product_price,
+      image: post.product_image,
+      productUrl: post.product_url || `/feed?post=${encodeURIComponent(post.post_id)}`,
       organizationName: post.provider,
       description: post.content,
       category: 'Boosted product',
@@ -378,4 +383,273 @@ export const updateRootMarketplaceProduct = async (req, res, next) => {
     const current = currentResult.rows[0];
     if (!current) return res.status(404).json({ success: false, message: 'Product not found.' });
     await queryNeon(`
-      UPDATE service_catalog_products SET published = ?, boosted = ?, updated_at = CURRENT_TIMESTAMP::
+      UPDATE service_catalog_products SET published = ?, boosted = ?, updated_at = CURRENT_TIMESTAMP::text
+      WHERE product_id = ?
+    `, [published === undefined ? current.published : published,
+      boosted === undefined ? current.boosted : boosted, productId]);
+    const savedResult = await queryNeon(`SELECT ${PRODUCT_FIELDS} FROM service_catalog_products WHERE product_id = ?`, [productId]);
+    json(res, parseProduct(savedResult.rows[0]));
+  } catch (error) { next(error); }
+};
+
+export const deleteRootMarketplaceProduct = async (req, res, next) => {
+  try {
+    const result = await queryNeon('DELETE FROM service_catalog_products WHERE product_id = ?', [String(req.params.productId)]);
+    if (!result.rowCount) return res.status(404).json({ success: false, message: 'Product not found.' });
+    json(res, { deleted: true });
+  } catch (error) { next(error); }
+};
+
+export const reviewAgentCatalogProduct = async (req, res, next) => {
+  try {
+    if (!isRoot(req)) return res.status(403).json({ success: false, message: 'Root access required.' });
+    const productId = String(req.params.productId || '');
+    const status = String(req.body?.status || '').toLowerCase();
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Status must be approved or rejected.' });
+    }
+    const productResult = await queryNeon(`
+      SELECT product_id, owner_user_id, approval_status
+      FROM service_catalog_products
+      WHERE product_id = ? AND owner_user_id IS NOT NULL
+    `, [productId]);
+    const product = productResult.rows[0];
+    if (!product) return res.status(404).json({ success: false, message: 'Agent catalog product not found.' });
+    if (product.approval_status !== 'pending') {
+      return res.status(409).json({ success: false, message: 'This product has already been reviewed.' });
+    }
+    const update = await queryNeon(`
+      UPDATE service_catalog_products
+      SET approval_status = ?, published = ?, updated_at = CURRENT_TIMESTAMP::text
+      WHERE product_id = ? AND approval_status = 'pending'
+    `, [status, status === 'approved', productId]);
+    if (update.rowCount !== 1) return res.status(409).json({ success: false, message: 'This product has already been reviewed.' });
+    const savedResult = await queryNeon(`SELECT ${PRODUCT_FIELDS} FROM service_catalog_products WHERE product_id = ?`, [productId]);
+    const saved = savedResult.rows[0];
+    return json(res, parseProduct(saved, true));
+  } catch (error) { next(error); }
+};
+
+export const getPromotions = async (req, res, next) => {
+  try {
+    const audienceStatus = String(req.query.audienceStatus || 'all').toLowerCase();
+    if (!PROMOTION_AUDIENCES.has(audienceStatus)) {
+      return res.status(400).json({ success: false, message: 'Choose a valid promotion audience.' });
+    }
+    const { rows } = await queryNeon(`
+      SELECT ${PROMOTION_FIELDS} FROM promotions
+      WHERE is_hidden = false AND (audience_status = 'all' OR audience_status = ?)
+      ORDER BY pinned DESC, created_at DESC
+    `, [audienceStatus]);
+    json(res, rows.map(row => ({
+      ...row,
+      alert_enabled: Boolean(row.alert_enabled),
+      pinned: Boolean(row.pinned),
+      popup_enabled: Boolean(row.popup_enabled),
+      is_hidden: Boolean(row.is_hidden),
+    })));
+  } catch (error) { next(error); }
+};
+
+const promotionInput = body => {
+  const title = String(body?.title || '').trim();
+  const message = String(body?.message || '').trim();
+  const imageData = body?.imageData == null ? null : String(body.imageData);
+  const audioData = body?.audioData == null ? null : String(body.audioData);
+  const buttonText = String(body?.buttonText || '').trim();
+  const buttonUrl = String(body?.buttonUrl || '').trim();
+  const backgroundColor = String(body?.backgroundColor ?? '');
+  const audienceStatus = String(body?.audienceStatus || 'all');
+  const badgeText = String(body?.badgeText || '').trim();
+  if (!title || title.length > 160 || message.length > 1200 || (imageData && imageData.length > 1800000) ||
+      (audioData && (audioData.length > 8500000 || !/^data:audio\/[a-z0-9.+-]+(?:;[^,]*)?;base64,[a-z0-9+/]+=*$/i.test(audioData))) ||
+      buttonText.length > 60 || buttonUrl.length > 500 ||
+      (backgroundColor !== '' && !/^#[0-9a-f]{6}$/i.test(backgroundColor)) ||
+      !PROMOTION_AUDIENCES.has(audienceStatus) || badgeText.length > 60 ||
+      (buttonUrl && !/^https?:\/\//i.test(buttonUrl) && !/^\/(?!\/)/.test(buttonUrl))) {
+    return null;
+  }
+  return {
+    title, message, imageData, audioData, buttonText: buttonText || null, buttonUrl: buttonUrl || null,
+    backgroundColor, audienceStatus, badgeText: badgeText || null,
+    alertEnabled: Boolean(body.alertEnabled),
+    pinned: Boolean(body.pinned),
+    popupEnabled: Boolean(body.popupEnabled),
+  };
+};
+
+export const getRootPromotions = async (req, res, next) => {
+  try {
+    const { rows } = await queryNeon(`SELECT ${PROMOTION_FIELDS} FROM promotions ORDER BY pinned DESC, created_at DESC`);
+    json(res, rows.map(row => ({
+      ...row,
+      alert_enabled: Boolean(row.alert_enabled),
+      pinned: Boolean(row.pinned),
+      popup_enabled: Boolean(row.popup_enabled),
+      is_hidden: Boolean(row.is_hidden),
+    })));
+  } catch (error) { next(error); }
+};
+
+export const saveRootPromotion = async (req, res, next) => {
+  try {
+    const fields = promotionInput(req.body);
+    if (!fields) return res.status(400).json({ success: false, message: 'Check the promotion title, text, image, audio, color, audience, and button link.' });
+    const promotionId = randomUUID();
+    await queryNeon(`
+      INSERT INTO promotions (
+        promotion_id, title, message, image_data, audio_data, button_text, button_url,
+        background_color, audience_status, badge_text, alert_enabled, pinned, popup_enabled
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [promotionId, fields.title, fields.message, fields.imageData, fields.audioData, fields.buttonText,
+      fields.buttonUrl, fields.backgroundColor, fields.audienceStatus, fields.badgeText, fields.alertEnabled, fields.pinned, fields.popupEnabled]);
+    const { rows } = await queryNeon(`SELECT ${PROMOTION_FIELDS} FROM promotions WHERE promotion_id = ?`, [promotionId]);
+    json(res, rows[0], 201);
+  } catch (error) { next(error); }
+};
+
+export const updateRootPromotion = async (req, res, next) => {
+  try {
+    const promotionId = String(req.params.promotionId);
+    const currentResult = await queryNeon(`SELECT ${PROMOTION_FIELDS} FROM promotions WHERE promotion_id = ?`, [promotionId]);
+    const current = currentResult.rows[0];
+    if (!current) return res.status(404).json({ success: false, message: 'Promotion not found.' });
+    if (req.body?.isHidden !== undefined) {
+      await queryNeon('UPDATE promotions SET is_hidden = ?, updated_at = CURRENT_TIMESTAMP::text WHERE promotion_id = ?',
+        [Boolean(req.body.isHidden), promotionId]);
+    } else {
+      const fields = promotionInput(req.body);
+      if (!fields) return res.status(400).json({ success: false, message: 'Check the promotion title, text, image, audio, color, audience, and button link.' });
+      await queryNeon(`
+        UPDATE promotions SET title = ?, message = ?, image_data = ?, audio_data = ?, button_text = ?, button_url = ?,
+          background_color = ?, audience_status = ?, badge_text = ?, alert_enabled = ?, pinned = ?,
+          popup_enabled = ?,
+          updated_at = CURRENT_TIMESTAMP::text
+        WHERE promotion_id = ?
+      `, [fields.title, fields.message, fields.imageData, fields.audioData, fields.buttonText, fields.buttonUrl,
+        fields.backgroundColor, fields.audienceStatus, fields.badgeText, fields.alertEnabled, fields.pinned, fields.popupEnabled, promotionId]);
+    }
+    const savedResult = await queryNeon(`SELECT ${PROMOTION_FIELDS} FROM promotions WHERE promotion_id = ?`, [promotionId]);
+    const saved = savedResult.rows[0];
+    if (!saved) return res.status(404).json({ success: false, message: 'Promotion not found.' });
+    json(res, {
+      ...saved,
+      alert_enabled: Boolean(saved.alert_enabled),
+      pinned: Boolean(saved.pinned),
+      popup_enabled: Boolean(saved.popup_enabled),
+      is_hidden: Boolean(saved.is_hidden),
+    });
+  } catch (error) { next(error); }
+};
+
+export const deleteRootPromotion = async (req, res, next) => {
+  try {
+    const result = await queryNeon('DELETE FROM promotions WHERE promotion_id = ?', [String(req.params.promotionId)]);
+    if (!result.rowCount) return res.status(404).json({ success: false, message: 'Promotion not found.' });
+    json(res, { deleted: true });
+  } catch (error) { next(error); }
+};
+
+export const requestPostBoost = async (req, res, next) => {
+  try {
+    const postId = String(req.body?.postId || '');
+    const amount = Number(req.body?.amount);
+    const paymentMethod = String(req.body?.paymentMethod || '').trim();
+    const paymentReference = String(req.body?.paymentReference || '').trim();
+    const paymentProof = req.body?.paymentProof ? String(req.body.paymentProof) : null;
+    if (!postId || !Number.isFinite(amount) || amount <= 0 || amount > 100000000 ||
+        !paymentMethod || paymentMethod.length > 80 || !paymentReference || paymentReference.length > 160 ||
+        (paymentProof && paymentProof.length > 1800000)) {
+      return res.status(400).json({ success: false, message: 'Enter a valid boost amount, payment method, and payment reference.' });
+    }
+    const userId = String(req.user.id);
+    const postResult = await queryNeon('SELECT post_id, user_id, visibility, product_name, product_url FROM social_posts WHERE post_id = ?', [postId]);
+    const post = postResult.rows[0];
+    if (!post || post.user_id !== userId) return res.status(404).json({ success: false, message: 'Your product post was not found.' });
+    if (post.visibility !== 'public') {
+      return res.status(400).json({ success: false, message: 'Only public posts can be boosted.' });
+    }
+    const requestId = randomUUID();
+    await queryNeon(`
+      INSERT INTO boost_requests (request_id, post_id, user_id, amount, payment_method, payment_reference, payment_proof)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, [requestId, postId, userId, Math.round(amount * 100) / 100, paymentMethod, paymentReference, paymentProof]);
+    const savedResult = await queryNeon(`
+      SELECT b.request_id, b.post_id, b.amount, b.payment_method, b.payment_reference, b.payment_proof, b.status, b.created_at,
+        p.product_name, p.product_url
+      FROM boost_requests b JOIN social_posts p ON p.post_id = b.post_id WHERE b.request_id = ?
+    `, [requestId]);
+    json(res, savedResult.rows[0], 201);
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ success: false, message: 'A boost request already exists for this post.' });
+    }
+    next(error);
+  }
+};
+
+export const getMyBoostRequests = async (req, res, next) => {
+  try {
+    const { rows } = await queryNeon(`
+      SELECT b.request_id, b.post_id, b.amount, b.payment_method, b.payment_reference, b.status, b.created_at,
+        p.product_name, p.product_url
+      FROM boost_requests b JOIN social_posts p ON p.post_id = b.post_id
+      WHERE b.user_id = ? ORDER BY b.created_at DESC
+    `, [String(req.user.id)]);
+    json(res, rows);
+  } catch (error) { next(error); }
+};
+
+export const getRootBoostRequests = async (req, res, next) => {
+  try {
+    const { rows } = await queryNeon(`
+      SELECT b.request_id, b.post_id, b.user_id, b.amount, b.payment_method, b.payment_reference, b.payment_proof,
+        b.status, b.created_at, p.product_name, p.product_url, p.content,
+        u.username, u.full_name
+      FROM boost_requests b
+      JOIN social_posts p ON p.post_id = b.post_id
+      LEFT JOIN users u ON u._id::text = b.user_id
+      ORDER BY CASE b.status WHEN 'pending' THEN 0 ELSE 1 END, b.created_at DESC
+    `);
+    json(res, rows);
+  } catch (error) { next(error); }
+};
+
+export const updateRootBoostRequest = async (req, res, next) => {
+  try {
+    const status = String(req.body?.status || '');
+    if (!['approved', 'rejected', 'unboosted'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Choose approve, reject, or unboost for this request.' });
+    }
+    const requestId = String(req.params.requestId);
+    const requestResult = await queryNeon('SELECT request_id, user_id, post_id, status FROM boost_requests WHERE request_id = ?', [requestId]);
+    const request = requestResult.rows[0];
+    if (!request) return res.status(404).json({ success: false, message: 'Boost request not found.' });
+    await withNeonTransaction(async client => {
+      await client.query(
+        'UPDATE boost_requests SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE request_id = $2',
+        [status, requestId]
+      );
+      if (status !== request.status) {
+        const message = status === 'approved'
+          ? 'Your post boost was approved and is now visible across the feed and marketplace.'
+          : status === 'unboosted'
+            ? 'Your post boost has been removed.'
+            : 'Your post boost request was not approved.';
+        await client.query(`
+          INSERT INTO social_notifications (notification_id, user_id, actor_id, type, message, link)
+          VALUES ($1, $2, $3, $4, $5, $6)
+        `, [
+          randomUUID(),
+          request.user_id,
+          String(req.user.id),
+          `boost_${status}`,
+          message,
+          `/feed?post=${encodeURIComponent(request.post_id)}`
+        ]);
+      }
+    });
+    const savedResult = await queryNeon('SELECT request_id, post_id, user_id, amount, status, updated_at FROM boost_requests WHERE request_id = ?', [requestId]);
+    json(res, savedResult.rows[0]);
+  } catch (error) { next(error); }
+};
