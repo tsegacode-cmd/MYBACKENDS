@@ -798,3 +798,23 @@ export const getRootAgentDetailsStatus = async (req, res, next) => {
     next(error);
   }
 };
+
+export const getRootAgentManagement = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const agents = await db.prepare(`
+      SELECT CAST(u._id AS TEXT) AS id, u.username, u.email, u.full_name, u.phone,
+             COALESCE(u.is_active, 1) AS is_active, u.created_at,
+             COALESCE(s.service_charge_percent, 0) AS service_charge_percent,
+             COALESCE(s.reward_percent, 0) AS reward_percent,
+             COALESCE(s.payment_details, '') AS payment_details
+      FROM users u
+      LEFT JOIN agent_settings s ON s.agent_user_id = CAST(u._id AS TEXT)
+      WHERE LOWER(u.role) = 'agent'
+      ORDER BY u.created_at DESC
+    `).all();
+    res.json({ success: true, data: agents });
+  } catch (error) {
+    next(error);
+  }
+};
