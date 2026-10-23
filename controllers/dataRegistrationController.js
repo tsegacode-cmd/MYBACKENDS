@@ -289,18 +289,18 @@ export const createRegistration = async (req, res, next) => {
     }
     
     const columnRows = await queryRows(`
-      SELECT column_name FROM information_schema.columns
+      SELECT column_name, is_nullable, column_default
+      FROM information_schema.columns
       WHERE table_schema = current_schema() AND table_name = 'data_registrations'
     `);
-    const dbColumns = columnRows.map(col => col.column_name);
-    if (!dbColumns.length) throw new Error('Neon data_registrations table is missing or has no columns.');
+    if (!columnRows.length) throw new Error('Neon data_registrations table is missing or has no columns.');
 
     const autoFields = ['_id', 'created_at', 'updated_at'];
-    const insertableColumns = dbColumns.filter(col => !autoFields.includes(col));
-
-    // Build data object with only insertable columns
     const insertData = {};
-    insertableColumns.forEach(column => {
+    for (const metadata of columnRows) {
+      const { column_name: column, is_nullable: isNullable, column_default: columnDefault } = metadata;
+      if (autoFields.includes(column)) continue;
+
       if (column === 'national_id') {
         insertData[column] = req.body.national_id?.trim() || null;
       } else if (column === 'round') {
@@ -308,7 +308,6 @@ export const createRegistration = async (req, res, next) => {
       } else if (req.body[column] !== undefined) {
         insertData[column] = req.body[column];
       } else {
-        // Set defaults for missing fields
         switch (column) {
           case 'work_type': insertData[column] = req.body.work_type || null; break;
           case 'staff_id': insertData[column] = req.body.staff_id || null; break;
@@ -338,10 +337,12 @@ export const createRegistration = async (req, res, next) => {
           case 'collected_amount': insertData[column] = req.body.collected_amount || null; break;
           case 'registration_datetime': insertData[column] = req.body.registration_datetime || null; break;
           case 'registered_at': insertData[column] = new Date().toISOString(); break;
-          default: insertData[column] = null;
+          default:
+            if (isNullable === 'YES' || columnDefault !== null) continue;
+            throw new Error(`Cannot save registration: required database column "${column}" has no value or default.`);
         }
       }
-    });
+    }
 
     // Validate required fields (flexible - works with client_name)
     const nameField = insertData.client_name;
@@ -397,8 +398,18 @@ export const createRegistration = async (req, res, next) => {
     });
 
   } catch (error) {
-    console.error('❌ BULLETPROOF INSERT FAILED:', error);
-    res.status(500).json({ success: false, message: 'Insert failed: ' + error.message });
+    console.error('❌ BULLETPROOF INSERT FAILED:', {
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+      constraint: error.constraint,
+      table: error.table,
+      column: error.column,
+    });
+    res.status(500).json({
+      success: false,
+      message: `Insert failed: ${error.message}${error.code ? ` (database code ${error.code})` : ''}`,
+    });
   }
 };
 
