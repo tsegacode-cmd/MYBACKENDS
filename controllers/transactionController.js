@@ -13,7 +13,7 @@ export const getAllTransactions = async (req, res, next) => {
     let transactions = [];
 
     if (!type || type === 'fixed') {
-      const fixedSql = `
+      let fixedSql = `
         SELECT 
           'fixed' AS transaction_type,
           ft.*,
@@ -26,15 +26,19 @@ export const getAllTransactions = async (req, res, next) => {
         JOIN service_types st ON ft.service_type_id = st._id
         LEFT JOIN users u ON ft.assigned_to = u._id
         WHERE 1=1
-        ${status ? 'AND ft.status = ?' : ''}
-        ${payment_status ? 'AND ft.payment_status = ?' : ''}
-        ORDER BY ft.transaction_date DESC
-        LIMIT ? OFFSET ?
       `;
 
       const params = [];
-      if (status) params.push(status);
-      if (payment_status) params.push(payment_status);
+      if (status) {
+        params.push(status);
+        fixedSql += ` AND ft.status = ?`;
+      }
+      if (payment_status) {
+        params.push(payment_status);
+        fixedSql += ` AND ft.payment_status = ?`;
+      }
+      
+      fixedSql += ` ORDER BY ft.transaction_date DESC LIMIT ? OFFSET ?`;
       params.push(normalizedLimit, offset);
 
       const fixed = await queryRows(fixedSql, params);
@@ -42,7 +46,7 @@ export const getAllTransactions = async (req, res, next) => {
     }
 
     if (!type || type === 'movable') {
-      const movableSql = `
+      let movableSql = `
         SELECT 
           'movable' AS transaction_type,
           mt.*,
@@ -55,15 +59,19 @@ export const getAllTransactions = async (req, res, next) => {
         JOIN service_types st ON mt.service_type_id = st._id
         LEFT JOIN users u ON mt.assigned_to = u._id
         WHERE 1=1
-        ${status ? 'AND mt.status = ?' : ''}
-        ${payment_status ? 'AND mt.payment_status = ?' : ''}
-        ORDER BY mt.transaction_date DESC
-        LIMIT ? OFFSET ?
       `;
 
       const params = [];
-      if (status) params.push(status);
-      if (payment_status) params.push(payment_status);
+      if (status) {
+        params.push(status);
+        movableSql += ` AND mt.status = ?`;
+      }
+      if (payment_status) {
+        params.push(payment_status);
+        movableSql += ` AND mt.payment_status = ?`;
+      }
+
+      movableSql += ` ORDER BY mt.transaction_date DESC LIMIT ? OFFSET ?`;
       params.push(normalizedLimit, offset);
 
       const movable = await queryRows(movableSql, params);
@@ -201,7 +209,7 @@ export const createFixedTransaction = async (req, res, next) => {
       RETURNING _id
     `;
 
-    const [result] = await queryRows(sql, [
+    const rows = await queryRows(sql, [
       transaction_number,
       contract_id || null,
       client_id,
@@ -226,7 +234,7 @@ export const createFixedTransaction = async (req, res, next) => {
     res.status(201).json({
       success: true,
       message: 'Fixed transaction created successfully',
-      data: { id: result._id }
+      data: { id: rows[0]?._id }
     });
   } catch (error) {
     next(error);
@@ -269,7 +277,7 @@ export const createMovableTransaction = async (req, res, next) => {
       RETURNING _id
     `;
 
-    const [result] = await queryRows(sql, [
+    const rows = await queryRows(sql, [
       transaction_number,
       contract_id || null,
       client_id,
@@ -295,7 +303,7 @@ export const createMovableTransaction = async (req, res, next) => {
     res.status(201).json({
       success: true,
       message: 'Movable transaction created successfully',
-      data: { id: result._id }
+      data: { id: rows[0]?._id }
     });
   } catch (error) {
     next(error);
