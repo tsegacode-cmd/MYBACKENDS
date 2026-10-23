@@ -6,6 +6,7 @@ dotenv.config();
 const { Pool } = pg;
 let pool = null;
 
+// 1. የ SQL ጥያቄዎችን ከ ? ወደ PostgreSQL ($1, $2) የሚቀይር ፋንክሽን
 export const toPostgresPlaceholders = (sql) => {
   let result = '';
   let parameterIndex = 0;
@@ -71,6 +72,7 @@ export const toPostgresPlaceholders = (sql) => {
   return result;
 };
 
+// 2. ከ Neon PostgreSQL ጋር ማገናኛ (SSL እና የደህንነት ማስተካከያ ያለው)
 export const initializeNeonDatabase = async () => {
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) {
@@ -80,6 +82,10 @@ export const initializeNeonDatabase = async () => {
   if (!pool) {
     pool = new Pool({
       connectionString,
+      // 💡 ለ Render እና Neon ግንኙነት በጣም አስፈላጊ የሆነው የ SSL ማስተካከያ
+      ssl: {
+        rejectUnauthorized: false
+      },
       max: Number.parseInt(process.env.DATABASE_POOL_SIZE || '10', 10),
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 10000
@@ -91,21 +97,28 @@ export const initializeNeonDatabase = async () => {
     console.log('✅ Neon PostgreSQL connected successfully');
     return pool;
   } catch (error) {
-    await pool.end();
+    if (pool) {
+      await pool.end();
+    }
     pool = null;
     throw new Error(`Neon PostgreSQL connection failed: ${error.message}`, { cause: error });
   }
 };
 
+// 3. ዳታቤዙ ካልተነሳ በራሱ እራሱን አስጀምሮ 쿼ሪ (Query) የሚያደርግ አስተማማኝ ፋንክሽን
 export const queryNeon = async (sql, params = []) => {
   if (!pool) {
-    const error = new Error(
-      process.env.DATABASE_URL
-        ? 'Neon PostgreSQL is not initialized. Check DATABASE_URL and backend startup logs.'
-        : 'Neon PostgreSQL is required for authentication. Configure DATABASE_URL in the backend environment.'
-    );
-    error.statusCode = 503;
-    throw error;
+    try {
+      await initializeNeonDatabase();
+    } catch (err) {
+      const error = new Error(
+        process.env.DATABASE_URL
+          ? 'Neon PostgreSQL is not initialized. Check DATABASE_URL and backend startup logs.'
+          : 'Neon PostgreSQL is required for authentication. Configure DATABASE_URL in the backend environment.'
+      );
+      error.statusCode = 503;
+      throw error;
+    }
   }
 
   try {
@@ -116,9 +129,10 @@ export const queryNeon = async (sql, params = []) => {
   }
 };
 
+// 4. ትራንዛክሽን (Transaction) ማስተዳደሪያ
 export const withNeonTransaction = async (callback) => {
   if (!pool) {
-    throw new Error('Neon PostgreSQL is not initialized; call initializeNeonDatabase first');
+    await initializeNeonDatabase();
   }
 
   const client = await pool.connect();
@@ -135,6 +149,7 @@ export const withNeonTransaction = async (callback) => {
   }
 };
 
+// 5. ዳታቤዝ ዝግ ስራዎች
 export const closeNeonDatabase = async () => {
   if (pool) {
     await pool.end();
