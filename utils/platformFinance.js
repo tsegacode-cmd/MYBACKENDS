@@ -6,8 +6,10 @@ export const recordPlatformPayout = async (
   client = null
 ) => {
   const payoutAmount = Math.round(Number(amount) * 100) / 100;
+  
+  // ዜሮ መሆን አለመሆኑን ብቻ ማረጋገጥ (Negative ቁጥሮችንም እንዲቀበል ማድረግ)
   if (!userId || !requestId || !entryType || !reference || !description ||
-      !Number.isFinite(payoutAmount) || payoutAmount <= 0) {
+      !Number.isFinite(payoutAmount) || payoutAmount === 0) {
     throw new Error('Platform payout details are invalid.');
   }
 
@@ -17,8 +19,14 @@ export const recordPlatformPayout = async (
     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
   `;
   const params = [
-    randomUUID(), String(userId), agentUserId == null ? null : String(agentUserId),
-    -payoutAmount, String(requestId), String(entryType), String(reference), String(description)
+    randomUUID(), 
+    String(userId), 
+    agentUserId == null ? null : String(agentUserId),
+    payoutAmount, // እንዳለ ራሱን መውሰድ አለበት (Double negation ማስቀረት)
+    String(requestId), 
+    String(entryType), 
+    String(reference), 
+    String(description)
   ];
 
   if (client) {
