@@ -16,49 +16,40 @@ const normalizeNumericFields = result => {
 const queryRows = async (sql, params = []) =>
   normalizeNumericFields(await queryNeon(sql, params));
 
-// Get dashboard statistics
+// Get dashboard statistics (Fixed syntax and clean PostgreSQL structure)
 export const getDashboardStats = async (req, res, next) => {
   try {
-    const [stats] = await queryRows(`
+    const result = await queryNeon(`
       SELECT
         (SELECT COUNT(*) FROM clients WHERE status = 'active') AS active_clients,
         (SELECT COUNT(*) FROM brokerage_contracts WHERE status = 'active') AS active_contracts,
         (SELECT COUNT(*) FROM fixed_transactions WHERE status IN ('pending', 'in_progress')) +
           (SELECT COUNT(*) FROM movable_transactions WHERE status IN ('pending', 'in_progress')) AS pending_transactions,
         (SELECT COUNT(*) FROM contact_inquiries WHERE status IN ('new', 'in_progress')) AS pending_inquiries,
-        (SELECT COALESCE(SUM(commission_amount - payment_received), 0)
-          FROM fixed_transactions WHERE payment_status <> 'paid') +
-        (SELECT COALESCE(SUM(commission_amount - payment_received), 0)
-          FROM movable_transactions WHERE payment_status <> 'paid') AS total_pending_payments,
-        (SELECT COALESCE(SUM(commission_amount), 0)
-          FROM fixed_transactions
-          WHERE status = 'completed'
-            AND NULLIF(transaction_date, '')::timestamp >= date_trunc('month', CURRENT_TIMESTAMP)
-            AND NULLIF(transaction_date, '')::timestamp < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month') +
-        (SELECT COALESCE(SUM(commission_amount), 0)
-          FROM movable_transactions
-          WHERE status = 'completed'
-            AND NULLIF(transaction_date, '')::timestamp >= date_trunc('month', CURRENT_TIMESTAMP)
-            AND NULLIF(transaction_date, '')::timestamp < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month') AS current_month_revenue,
-        (SELECT COALESCE(SUM(commission_amount), 0)
-          FROM fixed_transactions WHERE status = 'completed') +
-        (SELECT COALESCE(SUM(commission_amount), 0)
-          FROM movable_transactions WHERE status = 'completed') AS total_revenue
+        (SELECT COALESCE(SUM(commission_amount - payment_received), 0) FROM fixed_transactions WHERE payment_status <> 'paid') +
+          (SELECT COALESCE(SUM(commission_amount - payment_received), 0) FROM movable_transactions WHERE payment_status <> 'paid') AS total_pending_payments,
+        (SELECT COALESCE(SUM(commission_amount), 0) FROM fixed_transactions WHERE status = 'completed' AND NULLIF(transaction_date, '')::timestamp >= date_trunc('month', CURRENT_TIMESTAMP) AND NULLIF(transaction_date, '')::timestamp < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month') +
+          (SELECT COALESCE(SUM(commission_amount), 0) FROM movable_transactions WHERE status = 'completed' AND NULLIF(transaction_date, '')::timestamp >= date_trunc('month', CURRENT_TIMESTAMP) AND NULLIF(transaction_date, '')::timestamp < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month') AS current_month_revenue,
+        (SELECT COALESCE(SUM(commission_amount), 0) FROM fixed_transactions WHERE status = 'completed') +
+          (SELECT COALESCE(SUM(commission_amount), 0) FROM movable_transactions WHERE status = 'completed') AS total_revenue
     `);
+
+    const stats = result.rows[0] || {};
 
     res.json({
       success: true,
       data: {
-        activeClients: Number(stats.active_clients),
-        activeContracts: Number(stats.active_contracts),
-        pendingTransactions: Number(stats.pending_transactions),
-        pendingInquiries: Number(stats.pending_inquiries),
-        totalPendingPayments: Number(stats.total_pending_payments),
-        currentMonthRevenue: Number(stats.current_month_revenue),
-        totalRevenue: Number(stats.total_revenue),
+        activeClients: Number(stats.active_clients || 0),
+        activeContracts: Number(stats.active_contracts || 0),
+        pendingTransactions: Number(stats.pending_transactions || 0),
+        pendingInquiries: Number(stats.pending_inquiries || 0),
+        totalPendingPayments: Number(stats.total_pending_payments || 0),
+        currentMonthRevenue: Number(stats.current_month_revenue || 0),
+        totalRevenue: Number(stats.total_revenue || 0),
       }
     });
   } catch (error) {
+    console.error('❌ Get dashboard stats error:', error.message);
     next(error);
   }
 };
