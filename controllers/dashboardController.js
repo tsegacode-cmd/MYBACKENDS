@@ -138,7 +138,7 @@ export const getAgentPerformance = async (req, res, next) => {
       FROM users u
       LEFT JOIN fixed_totals ft ON u._id = ft.assigned_to
       LEFT JOIN movable_totals mt ON u._id = mt.assigned_to
-      WHERE u.role IN ('agent', 'manager') AND u.is_active = 1
+      WHERE u.role IN ('agent', 'manager') AND (u.is_active = 1 OR u.is_active IS TRUE)
       ORDER BY total_commission DESC
     `);
 
@@ -179,7 +179,7 @@ export const getServicePerformance = async (req, res, next) => {
       FROM service_types st
       LEFT JOIN fixed_totals ft ON st._id = ft.service_type_id
       LEFT JOIN movable_totals mt ON st._id = mt.service_type_id
-      WHERE st.is_active = 1
+      WHERE (st.is_active = 1 OR st.is_active IS TRUE)
       ORDER BY total_commission DESC
     `);
 
