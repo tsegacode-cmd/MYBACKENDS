@@ -310,4 +310,393 @@ export const reviewAgentWalletRequest = async (req, res, next) => {
             INSERT INTO platform_payout_ledger
               (payout_id, user_id, agent_user_id, amount, request_id, entry_type, reference, description)
             VALUES (?, ?, ?, ?, ?, 'agent_reward', ?, ?)
-          `).run(createId(), request.user_
+          `).run(createId(), request.user_id, request.agent_user_id, -Number(request.agent_reward), request.request_id, `agent-wallet:${request.request_id}:reward`, 'Agent wallet reward');
+        }
+      }
+      await db.prepare(`
+        UPDATE agent_wallet_requests
+        SET status = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP::text
+        WHERE request_id = ? AND status = 'pending'
+      `).run(status, userId(req), request.request_id);
+    });
+    await applyReview();
+    res.json({ success: true, data: { id: request.request_id, status } });
+  } catch (error) {
+    if (error.status) return res.status(error.status).json({ success: false, message: error.message });
+    next(error);
+  }
+};
+
+export const getAgentDashboard = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const id = userId(req);
+    const agent = await getAgent(id);
+    if (!agent || !agent.is_active) return res.status(403).json({ success: false, message: 'An active agent account is required' });
+    const summary = await db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM agent_products WHERE agent_user_id = ?) +
+        (SELECT COUNT(*) FROM service_catalog_products WHERE owner_user_id = ?) AS product_count,
+        (SELECT COUNT(*) FROM agent_products WHERE agent_user_id = ? AND approval_status = 'pending') +
+        (SELECT COUNT(*) FROM service_catalog_products WHERE owner_user_id = ? AND approval_status = 'pending') AS pending_products,
+        (SELECT COUNT(*) FROM agent_wallet_requests WHERE agent_user_id = ? AND status = 'pending') AS pending_wallet_requests,
+        (SELECT COUNT(*) FROM agent_package_requests WHERE agent_user_id = ? AND status = 'pending') AS pending_package_requests
+    `).get(id, id, id, id, id, id);
+    const teamMembers = await db.prepare(`
+      SELECT CAST(u._id AS TEXT) AS id, u.username, u.email, u.full_name, u.role,
+             u.phone, u.is_active, u.created_at, u.last_login,
+             EXISTS(
+               SELECT 1 FROM social_presence p
+               WHERE p.user_id = CAST(u._id AS TEXT)
+                 AND p.last_seen::timestamp >= CURRENT_TIMESTAMP - INTERVAL '90 seconds'
+             ) AS is_online,
+             (SELECT COUNT(*) FROM wallet_ledger l
+              WHERE l.user_id = CAST(u._id AS TEXT)) +
+             (SELECT COUNT(*) FROM agent_wallet_requests r
+              WHERE r.user_id = CAST(u._id AS TEXT) OR r.agent_user_id = CAST(u._id AS TEXT)) +
+             (SELECT COUNT(*) FROM agent_product_history h
+              WHERE h.agent_user_id = CAST(u._id AS TEXT)) AS activity_count,
+             COALESCE((SELECT SUM(l.amount) FROM wallet_ledger l
+                       WHERE l.user_id = CAST(u._id AS TEXT) AND l.balance_type = 'real'), 0) AS real_balance,
+             COALESCE((SELECT SUM(l.amount) FROM wallet_ledger l
+                       WHERE l.user_id = CAST(u._id AS TEXT) AND l.amount > 0
+                         AND l.entry_type IN ('product_sale', 'marketplace_sale')), 0)
+             + COALESCE((SELECT SUM(-p.amount) FROM platform_payout_ledger p
+                         WHERE p.agent_user_id = CAST(u._id AS TEXT)
+                           AND p.entry_type = 'agent_reward' AND p.amount < 0), 0) AS total_earned,
+             GREATEST(
+               COALESCE(u.last_login, u.created_at),
+               COALESCE((SELECT MAX(l.created_at) FROM wallet_ledger l
+                         WHERE l.user_id = CAST(u._id AS TEXT)), u.created_at),
+               COALESCE((SELECT MAX(r.created_at) FROM agent_wallet_requests r
+                         WHERE r.user_id = CAST(u._id AS TEXT) OR r.agent_user_id = CAST(u._id AS TEXT)), u.created_at),
+               COALESCE((SELECT MAX(h.created_at) FROM agent_product_history h
+                         WHERE h.agent_user_id = CAST(u._id AS TEXT)), u.created_at)
+             ) AS last_activity_at
+      FROM users u
+      WHERE u.created_by_user_id = ?
+      ORDER BY u.created_at DESC
+    `).all(id);
+    const serviceProducts = (await db.prepare(`
+      SELECT product_id AS id, service_key, product_json, published, approval_status, updated_at
+      FROM service_catalog_products WHERE owner_user_id = ?
+      ORDER BY updated_at DESC
+    `).all(id)).map(product => ({
+      ...JSON.parse(product.product_json),
+      id: product.id,
+      serviceKey: product.service_key,
+      published: Boolean(product.published),
+      approvalStatus: product.approval_status || 'approved',
+      updatedAt: product.updated_at,
+    }));
+    const teamSummary = {
+      team_member_count: teamMembers.length,
+      active_team_member_count: teamMembers.filter(member => member.is_active).length,
+      online_team_member_count: teamMembers.filter(member => member.is_online).length,
+    };
+    const earningsSummary = await db.prepare(`
+      SELECT
+        COALESCE((SELECT SUM(amount) FROM wallet_ledger
+                  WHERE user_id = ? AND entry_type = 'product_sale' AND amount > 0), 0) AS sale_commission_earned,
+        COALESCE((SELECT SUM(amount) FROM wallet_ledger
+                  WHERE user_id = ? AND entry_type = 'marketplace_sale' AND amount > 0), 0) AS service_product_sales_earned,
+        COALESCE((SELECT SUM(-amount) FROM platform_payout_ledger
+                  WHERE agent_user_id = ? AND entry_type = 'agent_reward' AND amount < 0), 0) AS wallet_request_rewards_earned
+    `).get(id, id, id);
+    const earnings = await db.prepare(`
+      SELECT entry_id AS id, 'Sale commission' AS source, amount, description, created_at
+      FROM wallet_ledger
+      WHERE user_id = ? AND entry_type = 'product_sale' AND amount > 0
+      UNION ALL
+      SELECT entry_id AS id, 'Service product sale' AS source, amount, description, created_at
+      FROM wallet_ledger
+      WHERE user_id = ? AND entry_type = 'marketplace_sale' AND amount > 0
+      UNION ALL
+      SELECT payout_id AS id, 'Wallet request reward' AS source, -amount AS amount, description, created_at
+      FROM platform_payout_ledger
+      WHERE agent_user_id = ? AND entry_type = 'agent_reward' AND amount < 0
+      ORDER BY created_at DESC
+      LIMIT 100
+    `).all(id, id, id);
+    const commissionRecords = await db.prepare(`
+      SELECT commission_id AS id, commission_type AS type, client_name, client_phone,
+             asset_description, location, amount, commission_rate, commission_amount,
+             status, notes, created_at
+      FROM agent_commission_records
+      WHERE agent_user_id = ?
+      ORDER BY created_at DESC
+      LIMIT 100
+    `).all(id);
+    const recordedCommissionTotals = await db.prepare(`
+      SELECT COUNT(*) AS completed_commission_count,
+             COALESCE(SUM(commission_amount), 0) AS completed_commission_amount
+      FROM agent_commission_records
+      WHERE agent_user_id = ? AND status = 'completed'
+    `).get(id);
+    const products = await db.prepare(`
+      SELECT product_id AS id, title, description, price, status, approval_status, created_at, updated_at
+      FROM agent_products WHERE agent_user_id = ? ORDER BY updated_at DESC
+    `).all(id);
+    const walletRequests = await db.prepare(`
+      SELECT r.request_id AS id, r.user_id, r.request_type AS type, r.amount, r.net_amount,
+             r.payment_method, r.payment_reference, r.status, r.created_at, r.reviewed_at,
+             CASE WHEN r.receipt_image IS NULL OR r.receipt_image = '' THEN 0 ELSE 1 END AS receipt_available,
+             u.username AS user_username, u.full_name AS user_name
+      FROM agent_wallet_requests r
+      LEFT JOIN users u ON CAST(u._id AS TEXT) = r.user_id
+      WHERE r.agent_user_id = ? ORDER BY r.created_at DESC LIMIT 100
+    `).all(id);
+    const packageRequests = await db.prepare(`
+      SELECT request_id AS id, amount, note, status, created_at
+      FROM agent_package_requests WHERE agent_user_id = ? ORDER BY created_at DESC
+    `).all(id);
+    res.json({
+      success: true,
+      data: {
+        agent: { id, username: agent.username, full_name: agent.full_name },
+        settings: {
+          service_charge_percent: agent.service_charge_percent,
+          reward_percent: agent.reward_percent,
+          payment_details: agent.payment_details,
+        },
+        package_balance: await getAgentPackageBalance(db, id),
+        summary: {
+          ...summary,
+          ...teamSummary,
+          ...earningsSummary,
+          ...recordedCommissionTotals,
+          total_earned: Number(earningsSummary.sale_commission_earned)
+            + Number(earningsSummary.service_product_sales_earned)
+            + Number(earningsSummary.wallet_request_rewards_earned),
+        },
+        products,
+        wallet_requests: walletRequests,
+        package_requests: packageRequests,
+        team_members: teamMembers,
+        earnings,
+        commission_records: commissionRecords,
+        service_products: serviceProducts,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getAgentDashboardStatus = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const id = userId(req);
+    const agent = await getAgent(id);
+    if (!agent || !agent.is_active) return res.status(403).json({ success: false, message: 'An active agent account is required' });
+    const products = await db.prepare(`
+      SELECT product_id AS id, status, approval_status, updated_at
+      FROM agent_products WHERE agent_user_id = ?
+    `).all(id);
+    const serviceProducts = await db.prepare(`
+      SELECT product_id AS id, published, approval_status AS approvalStatus, updated_at
+      FROM service_catalog_products WHERE owner_user_id = ?
+    `).all(id);
+    const walletRequests = await db.prepare(`
+      SELECT request_id AS id, status, reviewed_at FROM agent_wallet_requests
+      WHERE agent_user_id = ? ORDER BY created_at DESC LIMIT 100
+    `).all(id);
+    const packageRequests = await db.prepare(`
+      SELECT request_id AS id, status, reviewed_at FROM agent_package_requests
+      WHERE agent_user_id = ? ORDER BY created_at DESC
+    `).all(id);
+    const summary = await db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM agent_products WHERE agent_user_id = ?) +
+        (SELECT COUNT(*) FROM service_catalog_products WHERE owner_user_id = ?) AS product_count,
+        (SELECT COUNT(*) FROM agent_products WHERE agent_user_id = ? AND approval_status = 'pending') +
+        (SELECT COUNT(*) FROM service_catalog_products WHERE owner_user_id = ? AND approval_status = 'pending') AS pending_products,
+        (SELECT COUNT(*) FROM agent_wallet_requests WHERE agent_user_id = ? AND status = 'pending') AS pending_wallet_requests,
+        (SELECT COUNT(*) FROM agent_package_requests WHERE agent_user_id = ? AND status = 'pending') AS pending_package_requests
+    `).get(id, id, id, id, id, id);
+    return res.json({
+      success: true,
+      data: { summary, products, service_products: serviceProducts, wallet_requests: walletRequests, package_requests: packageRequests },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+export const getAgentTeamMemberActivity = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const id = userId(req);
+    const memberId = String(req.params.userId || '');
+    const member = await db.prepare(`
+      SELECT CAST(_id AS TEXT) AS id, username, email, full_name, role, phone,
+             is_active, created_at, last_login,
+             COALESCE((SELECT SUM(l.amount) FROM wallet_ledger l
+                       WHERE l.user_id = CAST(users._id AS TEXT) AND l.balance_type = 'real'), 0) AS real_balance,
+             EXISTS(
+               SELECT 1 FROM social_presence p
+               WHERE p.user_id = CAST(users._id AS TEXT)
+                 AND p.last_seen::timestamp >= CURRENT_TIMESTAMP - INTERVAL '90 seconds'
+             ) AS is_online
+      FROM users
+      WHERE CAST(_id AS TEXT) = ? AND created_by_user_id = ?
+    `).get(memberId, id);
+    if (!member) return res.status(404).json({ success: false, message: 'Managed account not found' });
+
+    const activity = await db.prepare(`
+      SELECT id, type, amount, status, description, reference, created_at, receipt_available
+      FROM (
+        SELECT entry_id AS id, entry_type AS type, amount, balance_type AS status,
+               description, reference, created_at, 0 AS receipt_available
+        FROM wallet_ledger WHERE user_id = ?
+        UNION ALL
+        SELECT request_id AS id, 'agent_' || request_type AS type, amount, status,
+               payment_reference AS description, request_id AS reference, created_at,
+               CASE WHEN request_type = 'deposit' AND receipt_image IS NOT NULL AND receipt_image != '' THEN 1 ELSE 0 END AS receipt_available
+        FROM agent_wallet_requests WHERE user_id = ?
+        UNION ALL
+        SELECT deposit_id AS id, 'deposit_request' AS type, amount, status,
+               payment_method || ' · ' || payment_reference AS description, payment_reference AS reference, created_at,
+               0 AS receipt_available
+        FROM wallet_deposits WHERE user_id = ?
+        UNION ALL
+        SELECT withdrawal_id AS id, 'withdrawal_request' AS type, amount, status,
+               payout_details AS description, withdrawal_id AS reference, created_at,
+               0 AS receipt_available
+        FROM wallet_withdrawals WHERE user_id = ?
+      ) sub
+      ORDER BY created_at DESC
+      LIMIT 100
+    `).all(memberId, memberId, memberId, memberId);
+    res.json({ success: true, data: { member, activity } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const createAgentCommissionRecord = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const agentId = userId(req);
+    const commissionType = String(req.body?.type || '').toLowerCase();
+    const clientName = String(req.body?.clientName || '').trim();
+    const clientPhone = String(req.body?.clientPhone || '').trim();
+    const assetDescription = String(req.body?.assetDescription || '').trim();
+    const location = String(req.body?.location || '').trim();
+    const amount = amountValue(req.body?.amount || 0);
+    const commissionRate = amountValue(req.body?.commissionRate || 0);
+    const commissionAmount = amountValue(req.body?.commissionAmount);
+    const status = String(req.body?.status || 'pending').toLowerCase();
+    const notes = String(req.body?.notes || '').trim();
+    const agent = await getAgent(agentId);
+    if (!agent || !agent.is_active) return res.status(403).json({ success: false, message: 'An active agent account is required' });
+    if (!['fixed', 'movable'].includes(commissionType) || !clientName || clientName.length > 160
+      || clientPhone.length > 30 || !assetDescription || assetDescription.length > 500
+      || location.length > 300 || !Number.isFinite(amount) || amount < 0
+      || !Number.isFinite(commissionRate) || commissionRate < 0 || commissionRate > 100
+      || !Number.isFinite(commissionAmount) || commissionAmount < 0
+      || !['pending', 'completed', 'cancelled'].includes(status) || notes.length > 2000) {
+      return res.status(400).json({ success: false, message: 'Provide valid commission details and status' });
+    }
+    const commissionId = createId();
+    await db.prepare(`
+      INSERT INTO agent_commission_records
+        (commission_id, agent_user_id, commission_type, client_name, client_phone,
+         asset_description, location, amount, commission_rate, commission_amount, status, notes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      commissionId, agentId, commissionType, clientName, clientPhone, assetDescription,
+      location, amount, commissionRate, commissionAmount, status, notes
+    );
+    res.status(201).json({ success: true, data: { id: commissionId } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const createAgentProduct = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const id = userId(req);
+    const agent = await getAgent(id);
+    const title = String(req.body?.title || '').trim();
+    const description = String(req.body?.description || '').trim();
+    const price = amountValue(req.body?.price);
+    const status = String(req.body?.status || 'selling').toLowerCase();
+    if (!agent || !agent.is_active) return res.status(403).json({ success: false, message: 'An active agent account is required' });
+    if (!title || title.length > 200 || description.length > 5000 || !isValidAmount(price)
+      || !['selling', 'buying'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Provide a valid title, description, price, and product status' });
+    }
+    const productId = createId();
+    const saveProduct = db.transaction(async () => {
+      await db.prepare(`
+        INSERT INTO agent_products (product_id, agent_user_id, title, description, price, status)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(productId, id, title, description, price, status);
+    });
+    await saveProduct();
+    res.status(201).json({ success: true, data: { id: productId } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const adjustAgentPackageBalance = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const agentUserId = String(req.body?.agentUserId || req.params?.agentId || '');
+    const amount = amountValue(req.body?.amount || 0);
+    const description = String(req.body?.description || 'Balance adjustment').trim();
+
+    if (!agentUserId || !Number.isFinite(amount) || amount === 0) {
+      return res.status(400).json({ success: false, message: 'Provide a valid agent user ID and non-zero amount' });
+    }
+
+    const agent = await getAgent(agentUserId);
+    if (!agent) {
+      return res.status(404).json({ success: false, message: 'Agent not found' });
+    }
+
+    await recordPackageLedger(
+      db, 
+      agentUserId, 
+      amount, 
+      `admin-adjust:${createId()}`, 
+      description
+    );
+
+    const newBalance = await getAgentPackageBalance(db, agentUserId);
+    res.json({ success: true, data: { agentUserId, balance: newBalance } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const adjustAgentWalletBalance = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const agentUserId = String(req.body?.agentUserId || req.params?.agentId || '');
+    const amount = amountValue(req.body?.amount || 0);
+    const description = String(req.body?.description || 'Wallet balance adjustment').trim();
+
+    if (!agentUserId || !Number.isFinite(amount) || amount === 0) {
+      return res.status(400).json({ success: false, message: 'Provide a valid agent user ID and non-zero amount' });
+    }
+
+    const agent = await getAgent(agentUserId);
+    if (!agent) {
+      return res.status(404).json({ success: false, message: 'Agent not found' });
+    }
+
+    await db.prepare(`
+      INSERT INTO wallet_ledger
+        (entry_id, user_id, amount, entry_type, reference, description, balance_type)
+      VALUES (?, ?, ?, 'admin_adjustment', ?, ?, 'real')
+    `).run(createId(), agentUserId, amount, `admin-adjust:${createId()}`, description);
+
+    res.json({ success: true, data: { agentUserId, adjustedAmount: amount } });
+  } catch (error) {
+    next(error);
+  }
+};
