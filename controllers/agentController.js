@@ -642,6 +642,43 @@ export const createAgentProduct = async (req, res, next) => {
   }
 };
 
+export const updateAgentProduct = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const id = userId(req);
+    const productId = String(req.params.productId || '');
+    const agent = await getAgent(id);
+    const title = String(req.body?.title || '').trim();
+    const description = String(req.body?.description || '').trim();
+    const price = amountValue(req.body?.price);
+    const status = String(req.body?.status || 'selling').toLowerCase();
+
+    if (!agent || !agent.is_active) return res.status(403).json({ success: false, message: 'An active agent account is required' });
+    if (!productId || !title || title.length > 200 || description.length > 5000 || !isValidAmount(price)
+      || !['selling', 'buying'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Provide valid product ID, title, description, price, and status' });
+    }
+
+    const product = await db.prepare(`
+      SELECT product_id FROM agent_products WHERE product_id = ? AND agent_user_id = ?
+    `).get(productId, id);
+
+    if (!product) {
+      return res.status(404).json({ success: false, message: 'Product not found or not owned by you' });
+    }
+
+    await db.prepare(`
+      UPDATE agent_products
+      SET title = ?, description = ?, price = ?, status = ?, updated_at = CURRENT_TIMESTAMP::text
+      WHERE product_id = ? AND agent_user_id = ?
+    `).run(title, description, price, status, productId, id);
+
+    res.json({ success: true, data: { id: productId } });
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const adjustAgentPackageBalance = async (req, res, next) => {
   try {
     const db = getAgentDB();
