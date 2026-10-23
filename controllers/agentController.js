@@ -748,3 +748,30 @@ export const getAgentPlatformAnalytics = async (req, res, next) => {
     next(error);
   }
 };
+
+export const getRootAgentDetails = async (req, res, next) => {
+  try {
+    const db = getAgentDB();
+    const agentId = String(req.params.agentId || '');
+    const agent = await getAgent(agentId);
+    if (!agent) {
+      return res.status(404).json({ success: false, message: 'Agent not found' });
+    }
+
+    const packageBalance = await getAgentPackageBalance(db, agentId);
+    const customersCount = (await db.prepare(`
+      SELECT COUNT(*) AS count FROM users WHERE created_by_user_id = ?
+    `).get(agentId))?.count || 0;
+
+    res.json({
+      success: true,
+      data: {
+        agent,
+        packageBalance,
+        customersCount: Number(customersCount),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
