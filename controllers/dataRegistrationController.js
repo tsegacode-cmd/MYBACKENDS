@@ -529,7 +529,6 @@ export const updateRegistration = async (req, res, next) => {
       )).rows;
       if (!existingRegistration) return null;
 
-      const updateEntries = Object.entries(filteredUpdates);
       const receiptNumber = String(
         Object.prototype.hasOwnProperty.call(filteredUpdates, 'receipt_no')
           ? filteredUpdates.receipt_no || ''
@@ -556,6 +555,7 @@ export const updateRegistration = async (req, res, next) => {
       if (Object.prototype.hasOwnProperty.call(filteredUpdates, 'receipt_no')) {
         filteredUpdates.receipt_no = receiptNumber || null;
       }
+      const updateEntries = Object.entries(filteredUpdates);
       if (updateEntries.length) {
         const assignments = updateEntries.map(([key], index) => `${key} = $${index + 1}`);
         const values = updateEntries.map(([, value]) => value);
