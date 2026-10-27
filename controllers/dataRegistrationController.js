@@ -6,6 +6,8 @@ const ensureRegistrationColumns = async () => {
   await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS receipt_no TEXT');
   await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS round BIGINT NOT NULL DEFAULT 1');
   await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS project_title TEXT');
+  await queryNeon("ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'unpaid'");
+  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS paid_amount DOUBLE PRECISION');
 };
 const ensureProjectTitleSchema = async () => {
   await queryNeon(`
@@ -313,6 +315,10 @@ export const createRegistration = async (req, res, next) => {
         insertData[column] = req.body.national_id?.trim() || null;
       } else if (column === 'round') {
         insertData[column] = registrationRound;
+      } else if (column === 'payment_status') {
+        insertData[column] = typeof req.body.payment_status === 'string'
+          ? req.body.payment_status.trim().toLowerCase() || 'unpaid'
+          : 'unpaid';
       } else if (req.body[column] !== undefined) {
         insertData[column] = req.body[column];
       } else {
@@ -403,6 +409,15 @@ export const createRegistration = async (req, res, next) => {
       const saved = result.rows[0];
       if (Number(saved?.round) !== registrationRound) {
         throw new Error(`Database saved Round ${saved?.round}; expected Round ${registrationRound}`);
+      }
+      const expectedPaymentStatus = typeof req.body.payment_status === 'string'
+        ? req.body.payment_status.trim().toLowerCase()
+        : null;
+      if (expectedPaymentStatus && String(saved?.payment_status || '').trim().toLowerCase() !== expectedPaymentStatus) {
+        throw new Error(`Database saved payment status "${saved?.payment_status || ''}"; expected "${expectedPaymentStatus}"`);
+      }
+      if (req.body.paid_amount != null && Number(saved?.paid_amount) !== Number(req.body.paid_amount)) {
+        throw new Error('Database did not save the requested payment amount.');
       }
       if (req.body.bank_receipt_pdf) {
         await saveRegistrationDocument(client, 'bank_receipt_documents', saved._id, req.body.bank_receipt_pdf);
@@ -498,6 +513,8 @@ export const updateRegistration = async (req, res, next) => {
             return res.status(400).json({ success: false, message: 'Round must be a positive whole number' });
           }
           filteredUpdates[key] = registrationRound;
+        } else if (key === 'payment_status' && typeof value === 'string') {
+          filteredUpdates[key] = value.trim().toLowerCase();
         } else {
           filteredUpdates[key] = value;
         }
@@ -576,7 +593,16 @@ export const updateRegistration = async (req, res, next) => {
       if (registrationImage !== undefined) {
         await saveRegistrationImage(client, id, registrationImage);
       }
-      return (await client.query('SELECT * FROM data_registrations WHERE _id = $1', [id])).rows[0];
+      const saved = (await client.query('SELECT * FROM data_registrations WHERE _id = $1', [id])).rows[0];
+      if (typeof filteredUpdates.payment_status === 'string' &&
+          String(saved?.payment_status || '').trim().toLowerCase() !== filteredUpdates.payment_status) {
+        throw new Error(`Database saved payment status "${saved?.payment_status || ''}"; expected "${filteredUpdates.payment_status}"`);
+      }
+      if (Object.prototype.hasOwnProperty.call(filteredUpdates, 'paid_amount') &&
+          Number(saved?.paid_amount) !== Number(filteredUpdates.paid_amount)) {
+        throw new Error('Database did not save the requested payment amount.');
+      }
+      return saved;
     });
     if (!updatedRegistration) {
       return res.status(404).json({
