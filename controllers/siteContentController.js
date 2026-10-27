@@ -77,8 +77,9 @@ const DEFAULT_SITE_CONTENT = {
   termsAndConditions: 'Welcome to REDSEA.\n\nUse the platform respectfully and provide accurate information. Rewards, promotions, and claim-game settings are managed by REDSEA and may change over time. Do not use multiple accounts, automated tools, or other methods to manipulate rewards.\n\nETB rewards are credited according to the applicable reward rules. Coin rewards are separate from ETB wallet balances. Daily Claim games have per-game limits and rolling 24-hour cooldowns. Review the reward and cooldown shown in the app before playing.\n\nBookings, payment requests, products, and services are subject to availability and the payment terms shown at checkout. Optional delivery fees are separate from booking payments and are due on receipt when delivery is requested.\n\nBy using REDSEA, you agree to follow these terms and applicable laws. Contact REDSEA support if you have a question about your account or a reward.',
   accountAccessSettings: {
     enabled: true,
+    visitorMenuVisibilityConfigured: false,
     rules: [
-      { role: 'visitor', label: 'Not logged in', enabled: true, hiddenMenus: [], hiddenRoutes: [], actions: { deleteRegistrations: false }, notes: '' },
+      { role: 'visitor', label: 'Not logged in', enabled: true, hiddenMenus: ['data-collect'], hiddenRoutes: [], actions: { deleteRegistrations: false }, notes: '' },
       { role: 'guest', label: 'Guest', enabled: true, hiddenMenus: ['data-collect'], hiddenRoutes: [], actions: { deleteRegistrations: false }, notes: '' },
       { role: 'user', label: 'User', enabled: true, hiddenMenus: ['data-collect'], hiddenRoutes: [], actions: { deleteRegistrations: false }, notes: '' },
       { role: 'staff', label: 'Staff', enabled: true, hiddenMenus: [], hiddenRoutes: [], actions: { deleteRegistrations: false }, notes: '' },
@@ -163,8 +164,10 @@ const OPTIONAL_FIELD_LIMITS = {
 
 const normalizeAccountAccessSettings = (settings = {}) => {
   const rules = Array.isArray(settings.rules) ? settings.rules : [];
+  const visitorMenuVisibilityConfigured = settings.visitorMenuVisibilityConfigured === true;
   return {
     enabled: settings.enabled !== false,
+    visitorMenuVisibilityConfigured,
     rules: rules
       .map((rule, index) => {
         const role = String(rule?.role || `role_${index + 1}`).trim().toLowerCase();
@@ -175,6 +178,9 @@ const normalizeAccountAccessSettings = (settings = {}) => {
               .map(value => value.trim())
               .filter(Boolean)
           : [];
+        if (role === 'visitor' && !visitorMenuVisibilityConfigured && !hiddenMenus.includes('data-collect')) {
+          hiddenMenus.push('data-collect');
+        }
         const hiddenRoutes = Array.isArray(rule?.hiddenRoutes)
           ? rule.hiddenRoutes
               .filter(value => typeof value === 'string')
@@ -209,7 +215,11 @@ const readSiteContent = async () => {
   `);
   const { rows } = await queryNeon('SELECT content_json FROM site_content_settings WHERE id = 1');
   const row = rows[0];
-  return row ? { ...DEFAULT_SITE_CONTENT, ...JSON.parse(row.content_json) } : DEFAULT_SITE_CONTENT;
+  const content = row ? { ...DEFAULT_SITE_CONTENT, ...JSON.parse(row.content_json) } : DEFAULT_SITE_CONTENT;
+  content.accountAccessSettings = normalizeAccountAccessSettings(
+    content.accountAccessSettings || DEFAULT_SITE_CONTENT.accountAccessSettings
+  );
+  return content;
 };
 
 export const getSiteContent = async (req, res) => {
