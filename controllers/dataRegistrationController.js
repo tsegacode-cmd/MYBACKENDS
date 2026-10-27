@@ -1,8 +1,11 @@
 import { queryNeon, withNeonTransaction } from '../config/neonDatabase.js';
 
 const queryRows = async (sql, params = []) => (await queryNeon(sql, params)).rows;
-const ensureNationalIdColumn = async () => {
+const ensureRegistrationColumns = async () => {
   await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS national_id TEXT');
+  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS receipt_no TEXT');
+  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS round BIGINT NOT NULL DEFAULT 1');
+  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS project_title TEXT');
 };
 const ensureProjectTitleSchema = async () => {
   await queryNeon(`
@@ -191,6 +194,7 @@ export const saveProjectTitleSettings = async (req, res, next) => {
 // Get all data registrations
 export const getAllRegistrations = async (req, res, next) => {
   try {
+    await ensureRegistrationColumns();
     const registrations = await queryRows(`
       SELECT registration.*,
         EXISTS (
@@ -271,7 +275,11 @@ export const createRegistration = async (req, res, next) => {
         (typeof req.body.national_id !== 'string' || req.body.national_id.trim().length > 100)) {
       return res.status(400).json({ success: false, message: 'National ID must be text no longer than 100 characters.' });
     }
-    await ensureNationalIdColumn();
+    if (req.body?.receipt_no != null &&
+        (typeof req.body.receipt_no !== 'string' || req.body.receipt_no.trim().length > 50)) {
+      return res.status(400).json({ success: false, message: 'Receipt number must be text no longer than 50 characters.' });
+    }
+    await ensureRegistrationColumns();
     const registrationRound = Number(req.body.round ?? 1);
     if (!Number.isInteger(registrationRound) || registrationRound < 1) {
       return res.status(400).json({ success: false, message: 'Round must be a positive whole number' });
@@ -360,6 +368,9 @@ export const createRegistration = async (req, res, next) => {
       });
     }
 
+    if (insertData.receipt_no != null) {
+      insertData.receipt_no = String(insertData.receipt_no).trim() || null;
+    }
     const finalColumns = Object.keys(insertData);
     const finalValues = Object.values(insertData);
     
@@ -367,6 +378,22 @@ export const createRegistration = async (req, res, next) => {
       throw new Error('The data_registrations schema contains an unsupported column name.');
     }
     const savedRegistration = await withNeonTransaction(async client => {
+      const receiptNumber = String(insertData.receipt_no || '').trim();
+      if (receiptNumber) {
+        const duplicateKey = `data-registration:${registrationRound}:${receiptNumber.toLocaleLowerCase()}`;
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [duplicateKey]);
+        const duplicate = await client.query(`
+          SELECT _id FROM data_registrations
+          WHERE round = $1 AND LOWER(BTRIM(receipt_no)) = LOWER(BTRIM($2))
+          LIMIT 1
+        `, [registrationRound, receiptNumber]);
+        if (duplicate.rowCount) {
+          const error = new Error(`Receipt number "${receiptNumber}" is already registered in Round ${registrationRound}.`);
+          error.statusCode = 409;
+          throw error;
+        }
+      }
+
       const placeholders = finalColumns.map((_, index) => `$${index + 1}`).join(', ');
       const result = await client.query(`
         INSERT INTO data_registrations (${finalColumns.join(', ')})
@@ -374,6 +401,9 @@ export const createRegistration = async (req, res, next) => {
         RETURNING *
       `, finalValues);
       const saved = result.rows[0];
+      if (Number(saved?.round) !== registrationRound) {
+        throw new Error(`Database saved Round ${saved?.round}; expected Round ${registrationRound}`);
+      }
       if (req.body.bank_receipt_pdf) {
         await saveRegistrationDocument(client, 'bank_receipt_documents', saved._id, req.body.bank_receipt_pdf);
       }
@@ -386,10 +416,6 @@ export const createRegistration = async (req, res, next) => {
       return saved;
     });
 
-    if (Number(savedRegistration?.round) !== registrationRound) {
-      throw new Error(`Database saved Round ${savedRegistration?.round}; expected Round ${registrationRound}`);
-    }
-
     console.log('✅ Registration created in Neon - ID:', savedRegistration._id, 'Round:', savedRegistration.round);
     res.status(201).json({
       success: true,
@@ -398,6 +424,9 @@ export const createRegistration = async (req, res, next) => {
     });
 
   } catch (error) {
+    if (error.statusCode === 409) {
+      return res.status(409).json({ success: false, message: error.message });
+    }
     console.error('❌ BULLETPROOF INSERT FAILED:', {
       message: error.message,
       code: error.code,
@@ -422,8 +451,13 @@ export const updateRegistration = async (req, res, next) => {
         (typeof updates.national_id !== 'string' || updates.national_id.trim().length > 100)) {
       return res.status(400).json({ success: false, message: 'National ID must be text no longer than 100 characters.' });
     }
+    if (updates.receipt_no != null &&
+        (typeof updates.receipt_no !== 'string' || updates.receipt_no.trim().length > 50)) {
+      return res.status(400).json({ success: false, message: 'Receipt number must be text no longer than 50 characters.' });
+    }
     if (typeof updates.national_id === 'string') updates.national_id = updates.national_id.trim() || null;
-    await ensureNationalIdColumn();
+    if (typeof updates.receipt_no === 'string') updates.receipt_no = updates.receipt_no.trim() || null;
+    await ensureRegistrationColumns();
     if (
       (Object.prototype.hasOwnProperty.call(updates, 'bank_receipt_pdf') && !isValidPdfDataUrl(updates.bank_receipt_pdf)) ||
       (Object.prototype.hasOwnProperty.call(updates, 'owner_receipt_pdf') && !isValidPdfDataUrl(updates.owner_receipt_pdf))
@@ -489,7 +523,39 @@ export const updateRegistration = async (req, res, next) => {
       throw new Error('The data_registrations schema contains an unsupported column name.');
     }
     const updatedRegistration = await withNeonTransaction(async client => {
+      const [existingRegistration] = (await client.query(
+        'SELECT _id, receipt_no, round FROM data_registrations WHERE _id = $1 FOR UPDATE',
+        [id]
+      )).rows;
+      if (!existingRegistration) return null;
+
       const updateEntries = Object.entries(filteredUpdates);
+      const receiptNumber = String(
+        Object.prototype.hasOwnProperty.call(filteredUpdates, 'receipt_no')
+          ? filteredUpdates.receipt_no || ''
+          : existingRegistration.receipt_no || ''
+      ).trim();
+      const registrationRound = Number(filteredUpdates.round ?? existingRegistration.round ?? 1);
+      const registrationIdentityChanged =
+        Object.prototype.hasOwnProperty.call(filteredUpdates, 'receipt_no') ||
+        Object.prototype.hasOwnProperty.call(filteredUpdates, 'round');
+      if (registrationIdentityChanged && receiptNumber) {
+        const duplicateKey = `data-registration:${registrationRound}:${receiptNumber.toLocaleLowerCase()}`;
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [duplicateKey]);
+        const duplicate = await client.query(`
+          SELECT _id FROM data_registrations
+          WHERE round = $1 AND LOWER(BTRIM(receipt_no)) = LOWER(BTRIM($2)) AND _id <> $3
+          LIMIT 1
+        `, [registrationRound, receiptNumber, id]);
+        if (duplicate.rowCount) {
+          const error = new Error(`Receipt number "${receiptNumber}" is already registered in Round ${registrationRound}.`);
+          error.statusCode = 409;
+          throw error;
+        }
+      }
+      if (Object.prototype.hasOwnProperty.call(filteredUpdates, 'receipt_no')) {
+        filteredUpdates.receipt_no = receiptNumber || null;
+      }
       if (updateEntries.length) {
         const assignments = updateEntries.map(([key], index) => `${key} = $${index + 1}`);
         const values = updateEntries.map(([, value]) => value);
@@ -501,12 +567,6 @@ export const updateRegistration = async (req, res, next) => {
         `, [...values, id]);
         if (!updated.rowCount) return null;
       }
-      const [existing] = (await client.query(
-        'SELECT _id FROM data_registrations WHERE _id = $1 FOR UPDATE',
-        [id]
-      )).rows;
-      if (!existing) return null;
-
       if (bankReceiptPdf !== undefined) {
         await saveRegistrationDocument(client, 'bank_receipt_documents', id, bankReceiptPdf);
       }
@@ -531,6 +591,9 @@ export const updateRegistration = async (req, res, next) => {
       skippedFields: skippedFields.length > 0 ? skippedFields : undefined
     });
   } catch (error) {
+    if (error.statusCode === 409) {
+      return res.status(409).json({ success: false, message: error.message });
+    }
     console.error('Failed to update registration:', error);
     next(error);
   }
