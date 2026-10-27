@@ -576,7 +576,7 @@ export const updateRegistration = async (req, res, next) => {
       if (updateEntries.length) {
         const assignments = updateEntries.map(([key], index) => `${key} = $${index + 1}`);
         const values = updateEntries.map(([, value]) => value);
-        assignments.push(`updated_at = CURRENT_TIMESTAMP::text`);
+        assignments.push(`updated_at = CURRENT_TIMESTAMP`);
         const updated = await client.query(`
           UPDATE data_registrations SET ${assignments.join(', ')}
           WHERE _id = $${values.length + 1}
