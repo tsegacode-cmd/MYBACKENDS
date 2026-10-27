@@ -78,14 +78,15 @@ const DEFAULT_SITE_CONTENT = {
   accountAccessSettings: {
     enabled: true,
     rules: [
-      { role: 'visitor', label: 'Not logged in', enabled: true, hiddenMenus: [], hiddenRoutes: [], notes: '' },
-      { role: 'guest', label: 'Guest', enabled: true, hiddenMenus: ['data-collect'], hiddenRoutes: [], notes: '' },
-      { role: 'user', label: 'User', enabled: true, hiddenMenus: ['data-collect'], hiddenRoutes: [], notes: '' },
-      { role: 'staff', label: 'Staff', enabled: true, hiddenMenus: [], hiddenRoutes: [], notes: '' },
-      { role: 'manager', label: 'Manager', enabled: true, hiddenMenus: [], hiddenRoutes: [], notes: '' },
-      { role: 'agent', label: 'Agent', enabled: true, hiddenMenus: [], hiddenRoutes: [], notes: '' },
-      { role: 'admin', label: 'Admin', enabled: true, hiddenMenus: [], hiddenRoutes: [], notes: '' },
-      { role: 'root', label: 'Root Admin', enabled: true, hiddenMenus: [], hiddenRoutes: [], notes: '' },
+      { role: 'visitor', label: 'Not logged in', enabled: true, hiddenMenus: [], hiddenRoutes: [], actions: { deleteRegistrations: false }, notes: '' },
+      { role: 'guest', label: 'Guest', enabled: true, hiddenMenus: ['data-collect'], hiddenRoutes: [], actions: { deleteRegistrations: false }, notes: '' },
+      { role: 'user', label: 'User', enabled: true, hiddenMenus: ['data-collect'], hiddenRoutes: [], actions: { deleteRegistrations: false }, notes: '' },
+      { role: 'staff', label: 'Staff', enabled: true, hiddenMenus: [], hiddenRoutes: [], actions: { deleteRegistrations: false }, notes: '' },
+      { role: 'manager', label: 'Manager', enabled: true, hiddenMenus: [], hiddenRoutes: [], actions: { deleteRegistrations: false }, notes: '' },
+      { role: 'agent', label: 'Agent', enabled: true, hiddenMenus: [], hiddenRoutes: [], actions: { deleteRegistrations: false }, notes: '' },
+      { role: 'driver', label: 'Driver', enabled: true, hiddenMenus: [], hiddenRoutes: [], actions: { deleteRegistrations: false }, notes: '' },
+      { role: 'admin', label: 'Admin', enabled: true, hiddenMenus: [], hiddenRoutes: [], actions: { deleteRegistrations: true }, notes: '' },
+      { role: 'root', label: 'Root Admin', enabled: true, hiddenMenus: [], hiddenRoutes: [], actions: { deleteRegistrations: true }, notes: '' },
     ]
   }
 };
@@ -186,6 +187,11 @@ const normalizeAccountAccessSettings = (settings = {}) => {
           enabled: rule?.enabled !== false,
           hiddenMenus,
           hiddenRoutes,
+          actions: {
+            deleteRegistrations: typeof rule?.actions?.deleteRegistrations === 'boolean'
+              ? rule.actions.deleteRegistrations
+              : ['admin', 'root'].includes(role),
+          },
           notes: typeof rule?.notes === 'string' ? rule.notes.slice(0, 500) : ''
         };
       })
