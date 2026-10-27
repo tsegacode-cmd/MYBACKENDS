@@ -853,7 +853,7 @@ export const getRootMiniRideData = async (req, res, next) => {
       LEFT JOIN users driver ON driver._id::text = r.driver_user_id
       ORDER BY r.created_at DESC LIMIT 500
     `),
-      neonRows(`
+     neonRows(`
       SELECT u._id::text AS user_id, u.username,
         COALESCE(NULLIF(u.full_name, ''), u.username) AS full_name, u.phone, u.is_active,
         COALESCE((SELECT SUM(w.amount) FROM wallet_ledger w
@@ -864,7 +864,8 @@ export const getRootMiniRideData = async (req, res, next) => {
           WHERE c.user_id = u._id::text), 0) AS coin_balance,
         CASE WHEN d.is_online = 1 AND d.location_updated_at::timestamptz >= CURRENT_TIMESTAMP - INTERVAL '90 seconds'
           AND u.is_active = 1 THEN 1 ELSE 0 END AS is_online,
-        d.latitude, d.longitude, d.location_updated_at
+        d.latitude, d.longitude, d.location_updated_at,
+        COALESCE(d.driver_commission_percent, 0) AS driver_commission_percent
       FROM users u LEFT JOIN mini_ride_drivers d ON d.user_id = u._id::text
       WHERE LOWER(u.role) = 'driver' ORDER BY u.username
     `),
