@@ -78,6 +78,7 @@ const DEFAULT_SITE_CONTENT = {
   accountAccessSettings: {
     enabled: true,
     rules: [
+      { role: 'visitor', label: 'Not logged in', enabled: true, hiddenMenus: [], hiddenRoutes: [], notes: '' },
       { role: 'guest', label: 'Guest', enabled: true, hiddenMenus: ['data-collect'], hiddenRoutes: [], notes: '' },
       { role: 'user', label: 'User', enabled: true, hiddenMenus: ['data-collect'], hiddenRoutes: [], notes: '' },
       { role: 'staff', label: 'Staff', enabled: true, hiddenMenus: [], hiddenRoutes: [], notes: '' },
