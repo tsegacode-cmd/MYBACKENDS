@@ -1073,6 +1073,51 @@ export const reviewMiniRidePayment = async (req, res, next) => {
 };
 // ... [የቀረው የኮድ ክፍል ካቆመበት የሚቀጥለው] ...
 
+export const completeMiniRide = async (ride, userId, next, res = null) => {
+  try {
+    const finished = await db().transaction(async () => {
+      const changed = await db().prepare(`
+        UPDATE mini_rides SET status = 'completed', finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE ride_id = ? AND status IN ('accepted', 'in_progress')
+        RETURNING *
+      `).run(ride.ride_id);
+      if (!changed.changes) return null;
+      return changed.rows[0];
+    })();
+    if (!finished) {
+      if (res) return res.status(409).json({ success: false, message: 'This ride has already been finished or cancelled.' });
+      return;
+    }
+    await creditDriverEarning(ride, Number(ride.route_distance_km || 0) * 15); // ምሳሌ የክፍያ ስሌት
+    await rewardCompletedRide(ride);
+    await sendNotification(ride.passenger_user_id, userId, 'mini_ride', 'Your Mini Ride has been completed. Thank you!', '/mini-ride');
+    if (ride.driver_user_id && ride.driver_user_id !== userId) {
+      await sendNotification(ride.driver_user_id, userId, 'mini_ride', `Mini Ride ${ride.ride_id} was completed.`, '/driver');
+    }
+    await notifyRoot(userId, `Mini Ride ${ride.ride_id} completed.`);
+    if (res) {
+      response(res, await getRideDetails(await getRide(ride.ride_id)));
+    }
+  } catch (error) {
+    if (next) next(error);
+  }
+};
+export const finishMiniRide = async (req, res, next) => {
+  try {
+    const ride = await getRide(req.params.rideId);
+    const userId = accountId(req);
+    const role = roleOf(req);
+    const canFinish = ride && (
+      String(ride.passenger_user_id) === userId ||
+      (role === 'driver' && String(ride.driver_user_id) === userId)
+    );
+    if (!canFinish) {
+      return res.status(403).json({ success: false, message: 'Only this ride’s passenger or assigned driver can finish the trip.' });
+    }
+    return await completeMiniRide(ride, userId, next, res);
+  } catch (error) { next(error); }
+};
+
 export const updateMiniRidePause = async (req, res, next) => {
   try {
     const ride = await getRide(req.params.rideId);
@@ -1084,9 +1129,9 @@ export const updateMiniRidePause = async (req, res, next) => {
       return res.status(409).json({ success: false, message: 'Ride must be in progress to pause or resume.' });
     }
     const pause = req.body?.pause === true;
-    const updated = await db().prepare(`
+    await db().prepare(`
       UPDATE mini_rides SET ride_paused_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END,
-        updated_at = CURRENT_TIMESTAMP WHERE ride_id = ? RETURNING *
+        updated_at = CURRENT_TIMESTAMP WHERE ride_id = ?
     `).run(pause ? 1 : 0, ride.ride_id);
     response(res, await getRideDetails(await getRide(ride.ride_id)));
   } catch (error) { next(error); }
@@ -1107,7 +1152,7 @@ export const completeMiniRide = async (ride, userId, next, res = null) => {
       if (res) return res.status(409).json({ success: false, message: 'This ride has already been finished or cancelled.' });
       return;
     }
-    await creditDriverEarning(ride, Number(ride.route_distance_km || 0) * 15); // ምሳሌ የክፍያ ስሌት
+    await creditDriverEarning(ride, Number(ride.route_distance_km || 0) * 15);
     await rewardCompletedRide(ride);
     await sendNotification(ride.passenger_user_id, userId, 'mini_ride', 'Your Mini Ride has been completed. Thank you!', '/mini-ride');
     if (ride.driver_user_id && ride.driver_user_id !== userId) {
