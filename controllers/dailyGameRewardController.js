@@ -8,9 +8,53 @@ const GAME_META = {
   'boom-mines': { title: 'Boom Mine', icon: '💎' },
 };
 const MAX_COINS = 1000000000;
+const DEFAULT_GAMES = {
+  wheel: {
+    enabled: true,
+    playsPer24Hours: 3,
+    segments: [
+      { id: 'small', label: 'Small win', coins: 5 },
+      { id: 'medium', label: 'Good win', coins: 10 },
+      { id: 'jackpot', label: 'Jackpot', coins: 25 },
+      { id: 'try-again', label: 'Try again', coins: 0 },
+      { id: 'bonus', label: 'Bonus', coins: 15 },
+      { id: 'lucky', label: 'Lucky win', coins: 8 },
+    ],
+  },
+  slots: {
+    enabled: true,
+    playsPer24Hours: 3,
+    segments: [
+      { id: 'pair', label: 'Matching pair', coins: 5 },
+      { id: 'triple', label: 'Triple match', coins: 20 },
+      { id: 'jackpot', label: 'Jackpot', coins: 50 },
+      { id: 'try-again', label: 'Try again', coins: 0 },
+      { id: 'lucky', label: 'Lucky symbols', coins: 10 },
+    ],
+  },
+  'boom-mines': {
+    enabled: true,
+    playsPer24Hours: 3,
+    segments: [
+      { id: 'safe', label: 'Safe pick', coins: 5 },
+      { id: 'gold', label: 'Gold mine', coins: 15 },
+      { id: 'diamond', label: 'Diamond mine', coins: 30 },
+      { id: 'try-again', label: 'Try again', coins: 0 },
+    ],
+  },
+};
 
 const json = (res, data, status = 200) => res.status(status).json({ success: true, data });
+const ensureSettingsRow = async db => {
+  await db.query(`
+    INSERT INTO daily_game_reward_settings (setting_id, games_json)
+    VALUES (1, $1)
+    ON CONFLICT (setting_id) DO NOTHING
+  `, [JSON.stringify(DEFAULT_GAMES)]);
+};
+
 const readGames = async () => {
+  await ensureSettingsRow({ query: queryNeon });
   const { rows } = await queryNeon('SELECT games_json FROM daily_game_reward_settings WHERE setting_id = 1');
   const row = rows[0];
   if (!row) throw new Error('Daily game reward settings are missing.');
@@ -116,6 +160,7 @@ export const playDailyRewardGame = async (req, res, next) => {
     }
 
     const play = await withNeonTransaction(async client => {
+      await ensureSettingsRow(client);
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [requestId]);
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`daily-game:${userId}:${gameId}`]);
       const existingResult = await client.query(
@@ -233,12 +278,17 @@ export const saveRootDailyGameRewardSettings = async (req, res, next) => {
         message: 'Enter 1–10 plays per 24 hours and 2–12 segments per game with valid labels and non-negative whole coin rewards.',
       });
     }
+    const gamesJson = JSON.stringify(games);
     const result = await queryNeon(`
-      UPDATE daily_game_reward_settings
-      SET games_json = $1, updated_at = CURRENT_TIMESTAMP::text
-      WHERE setting_id = 1
-    `, [JSON.stringify(games)]);
-    if (result.rowCount !== 1) throw new Error('Daily game reward settings were not saved.');
+      INSERT INTO daily_game_reward_settings (setting_id, games_json, updated_at)
+      VALUES (1, $1, CURRENT_TIMESTAMP::text)
+      ON CONFLICT (setting_id) DO UPDATE
+      SET games_json = EXCLUDED.games_json, updated_at = EXCLUDED.updated_at
+      RETURNING games_json
+    `, [gamesJson]);
+    if (result.rowCount !== 1 || result.rows?.[0]?.games_json !== gamesJson) {
+      throw new Error('Daily game reward settings were not saved.');
+    }
     json(res, games);
   } catch (error) {
     next(error);
