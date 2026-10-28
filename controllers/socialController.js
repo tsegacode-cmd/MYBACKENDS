@@ -299,6 +299,55 @@ const getCoinLevelRules = async () => await (db().prepare(
   'SELECT level, required_coins, reward_etb FROM wallet_coin_level_rules ORDER BY level'
 ).all());
 
+export const DEFAULT_COIN_LEVEL_RULES = Object.freeze([
+  { level: 1, required_coins: 0, reward_etb: 0 },
+  { level: 2, required_coins: 100, reward_etb: 0 },
+  { level: 3, required_coins: 500, reward_etb: 0 },
+  { level: 4, required_coins: 1000, reward_etb: 0 },
+  { level: 5, required_coins: 2500, reward_etb: 0 },
+  { level: 6, required_coins: 5000, reward_etb: 0 },
+  { level: 7, required_coins: 10000, reward_etb: 0 },
+  { level: 8, required_coins: 25000, reward_etb: 0 },
+].map(rule => Object.freeze(rule)));
+
+export const normalizeCoinLevelRules = submittedRules => {
+  if (!Array.isArray(submittedRules) || submittedRules.length !== DEFAULT_COIN_LEVEL_RULES.length) return null;
+  const parseNumber = value => {
+    if (typeof value !== 'number' && typeof value !== 'string') return NaN;
+    if (typeof value === 'string' && !value.trim()) return NaN;
+    return Number(value);
+  };
+  const rules = submittedRules.map(rule => ({
+    level: parseNumber(rule?.level),
+    required_coins: parseNumber(rule?.required_coins),
+    reward_etb: parseNumber(rule?.reward_etb),
+  }));
+  if (rules.some((rule, index) =>
+    !Number.isSafeInteger(rule.level) ||
+    rule.level !== index + 1 ||
+    !Number.isSafeInteger(rule.required_coins) ||
+    rule.required_coins < 0 ||
+    !Number.isFinite(rule.reward_etb) ||
+    rule.reward_etb < 0 ||
+    rule.reward_etb > 1000000000 ||
+    Math.abs(rule.reward_etb * 100 - Math.round(rule.reward_etb * 100)) > 1e-8
+  ) || rules.slice(1).some((rule, index) => rule.required_coins <= rules[index].required_coins)) {
+    return null;
+  }
+  return rules;
+};
+
+const initializeCoinLevelRules = async () => {
+  const insertDefault = db().prepare(`
+    INSERT INTO wallet_coin_level_rules (level, required_coins, reward_etb)
+    VALUES (?, ?, ?)
+    ON CONFLICT(level) DO NOTHING
+  `);
+  for (const rule of DEFAULT_COIN_LEVEL_RULES) {
+    await insertDefault.run(rule.level, rule.required_coins, rule.reward_etb);
+  }
+};
+
 const awardReachedCoinLevels = async userId => {
   const earnedCoins = await (getLifetimeEarnedCoins(userId));
   if (earnedCoins <= 0) return;
@@ -2148,9 +2197,10 @@ export const getRootWalletData = async (req, res, next) => {
       LEFT JOIN users u ON CAST(u._id AS TEXT) = d.user_id
       ORDER BY CASE d.status WHEN 'pending' THEN 0 ELSE 1 END, d.created_at DESC LIMIT 200
     `).all());
-    const roles = await (db().prepare('SELECT DISTINCT role FROM users WHERE role IS NOT NULL').all()).map(row => row.role);
+    const roleRows = await (db().prepare('SELECT DISTINCT role FROM users WHERE role IS NOT NULL').all());
+    const roles = roleRows.map(row => row.role);
     ['user', 'guest', 'staff', 'admin'].forEach(role => { if (!roles.includes(role)) roles.push(role); });
-    const settings = roles.map(async role => await (roleRates(role)));
+    const settings = await Promise.all(roles.map(role => roleRates(role)));
     json(res, { users, withdrawals, deposits, settings });
   } catch (error) { next(error); }
 };
@@ -2194,49 +2244,45 @@ export const getMyCoinLevel = async (req, res, next) => {
 export const getRootCoinLevelRules = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
+    await initializeCoinLevelRules();
     json(res, await (getCoinLevelRules()));
-  } catch (error) { next(error); }
+  } catch (error) {
+    console.error('Could not load coin-level rules from the database:', error);
+    res.status(500).json({ success: false, message: 'Could not load coin-level rules from the database.' });
+  }
 };
 
 export const saveRootCoinLevelRules = async (req, res, next) => {
   try {
     if (!isRoot(req.user)) return res.status(403).json({ success: false, message: 'Root access required.' });
     const submittedRules = req.body?.rules;
-    if (!Array.isArray(submittedRules) || submittedRules.length !== 8) {
-      return res.status(400).json({ success: false, message: 'Configure all eight coin levels.' });
-    }
-    const rules = submittedRules.map((rule, index) => ({
-      level: Number(rule?.level),
-      required_coins: Number(rule?.required_coins),
-      reward_etb: Number(rule?.reward_etb),
-    }));
-    if (rules.some((rule, index) =>
-      rule.level !== index + 1 ||
-      !Number.isSafeInteger(rule.required_coins) ||
-      rule.required_coins < 0 ||
-      !Number.isFinite(rule.reward_etb) ||
-      rule.reward_etb < 0 ||
-      rule.reward_etb > 1000000000 ||
-      Math.round(rule.reward_etb * 100) !== rule.reward_etb * 100
-    ) || rules.slice(1).some((rule, index) => rule.required_coins <= rules[index].required_coins)) {
+    const rules = normalizeCoinLevelRules(submittedRules);
+    if (!rules) {
       return res.status(400).json({
         success: false,
-        message: 'Coin thresholds must be non-negative whole numbers and increase at every level; ETB rewards must be valid amounts with up to two decimal places.',
+        message: 'Provide all eight sequential levels with increasing whole-number coin thresholds and ETB rewards to two decimal places.',
       });
     }
     const save = db().transaction(async () => {
-      const update = db().prepare(`
-        UPDATE wallet_coin_level_rules
-        SET required_coins = ?, reward_etb = ?, updated_at = CURRENT_TIMESTAMP::text
-        WHERE level = ?
+      await initializeCoinLevelRules();
+      const upsert = db().prepare(`
+        INSERT INTO wallet_coin_level_rules (level, required_coins, reward_etb, updated_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP::text)
+        ON CONFLICT(level) DO UPDATE SET
+          required_coins = excluded.required_coins,
+          reward_etb = excluded.reward_etb,
+          updated_at = CURRENT_TIMESTAMP::text
       `);
-      for (const rule of rules) await (update.run(rule.required_coins, rule.reward_etb, rule.level));
+      for (const rule of rules) await (upsert.run(rule.level, rule.required_coins, rule.reward_etb));
       const users = await (db().prepare('SELECT CAST(_id AS TEXT) AS user_id FROM users').all());
       for (const user of users) await (awardReachedCoinLevels(user.user_id));
     });
     await save();
     json(res, await (getCoinLevelRules()));
-  } catch (error) { next(error); }
+  } catch (error) {
+    console.error('Could not save coin-level rules to the database:', error);
+    res.status(500).json({ success: false, message: 'Could not save coin-level rules to the database.' });
+  }
 };
 
 export const getRootCoinLevelHistory = async (req, res, next) => {
