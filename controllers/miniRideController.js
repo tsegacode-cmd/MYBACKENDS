@@ -36,7 +36,41 @@ const neonRows = async (sql, params = []) => (await queryNeon(sql, params)).rows
 const neonFirst = async (sql, params = []) => (await queryNeon(sql, params)).rows[0];
 const neonTransactionQuery = (client, sql, params = []) =>
   client.query(toPostgresPlaceholders(sql), params);
-const getNeonSettings = () => neonFirst('SELECT * FROM mini_ride_settings WHERE id = 1');
+export const createMiniRideSettingsPersistence = execute => ({
+  async ensure() {
+    await execute(`
+      INSERT INTO mini_ride_settings (id) VALUES (1)
+      ON CONFLICT (id) DO NOTHING
+    `);
+    const settings = (await execute('SELECT * FROM mini_ride_settings WHERE id = 1')).rows[0];
+    if (!settings) throw new Error('Mini Ride settings could not be persisted.');
+    return settings;
+  },
+  async upsert(numbers) {
+    const settings = (await execute(`
+      INSERT INTO mini_ride_settings (
+        id, base_fare, fare_per_km, fare_per_ton,
+        driver_commission_percent, passenger_coin_reward, driver_coin_reward, updated_at
+      ) VALUES (1, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT (id) DO UPDATE SET
+        base_fare = EXCLUDED.base_fare,
+        fare_per_km = EXCLUDED.fare_per_km,
+        fare_per_ton = EXCLUDED.fare_per_ton,
+        driver_commission_percent = EXCLUDED.driver_commission_percent,
+        passenger_coin_reward = EXCLUDED.passenger_coin_reward,
+        driver_coin_reward = EXCLUDED.driver_coin_reward,
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING *
+    `, [
+      numbers.base_fare, numbers.fare_per_km, numbers.fare_per_ton,
+      numbers.driver_commission_percent, numbers.passenger_coin_reward, numbers.driver_coin_reward,
+    ])).rows[0];
+    if (!settings) throw new Error('Mini Ride settings could not be persisted.');
+    return settings;
+  },
+});
+const miniRideSettingsPersistence = createMiniRideSettingsPersistence(queryNeon);
+const getNeonSettings = () => miniRideSettingsPersistence.ensure();
 const getNeonRide = rideId => neonFirst(`
   SELECT r.*, passenger.username AS passenger_username,
     driver.username AS driver_username,
@@ -853,7 +887,7 @@ export const getRootMiniRideData = async (req, res, next) => {
       LEFT JOIN users driver ON driver._id::text = r.driver_user_id
       ORDER BY r.created_at DESC LIMIT 500
     `),
-     neonRows(`
+      neonRows(`
       SELECT u._id::text AS user_id, u.username,
         COALESCE(NULLIF(u.full_name, ''), u.username) AS full_name, u.phone, u.is_active,
         COALESCE((SELECT SUM(w.amount) FROM wallet_ledger w
@@ -864,8 +898,7 @@ export const getRootMiniRideData = async (req, res, next) => {
           WHERE c.user_id = u._id::text), 0) AS coin_balance,
         CASE WHEN d.is_online = 1 AND d.location_updated_at::timestamptz >= CURRENT_TIMESTAMP - INTERVAL '90 seconds'
           AND u.is_active = 1 THEN 1 ELSE 0 END AS is_online,
-        d.latitude, d.longitude, d.location_updated_at,
-        COALESCE(d.driver_commission_percent, 0) AS driver_commission_percent
+        d.latitude, d.longitude, d.location_updated_at
       FROM users u LEFT JOIN mini_ride_drivers d ON d.user_id = u._id::text
       WHERE LOWER(u.role) = 'driver' ORDER BY u.username
     `),
@@ -980,15 +1013,7 @@ export const updateRootMiniRideSettings = async (req, res, next) => {
     if (!Number.isSafeInteger(numbers.passenger_coin_reward) || !Number.isSafeInteger(numbers.driver_coin_reward)) {
       return res.status(400).json({ success: false, message: 'Coin rewards must be whole numbers.' });
     }
-    await queryNeon(`
-      UPDATE mini_ride_settings SET base_fare = ?, fare_per_km = ?, fare_per_ton = ?,
-        driver_commission_percent = ?, passenger_coin_reward = ?, driver_coin_reward = ?,
-        updated_at = CURRENT_TIMESTAMP WHERE id = 1
-    `, [
-      numbers.base_fare, numbers.fare_per_km, numbers.fare_per_ton,
-      numbers.driver_commission_percent, numbers.passenger_coin_reward, numbers.driver_coin_reward
-    ]);
-    response(res, await getNeonSettings());
+    response(res, await miniRideSettingsPersistence.upsert(numbers));
   } catch (error) { next(error); }
 };
 
