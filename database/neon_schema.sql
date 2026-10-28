@@ -208,6 +208,7 @@ CREATE TABLE IF NOT EXISTS data_registrations (
       staff_id BIGINT,
       staff_username TEXT,
       staff_full_name TEXT,
+      staff_role TEXT,
       client_name TEXT,
       city TEXT DEFAULT 'Harar',
       kebele TEXT,
