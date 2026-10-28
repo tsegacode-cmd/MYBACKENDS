@@ -8,9 +8,10 @@
     "start": "node server.js",
     "dev": "nodemon server.js",
     "migrate-sqlite-to-neon": "node scripts/migrateSqliteToNeon.js",
+    "export-neon-schema": "node scripts/exportNeonSchema.js",
     "check-neon": "node scripts/checkNeonDatabase.js",
     "add-unapproved-test": "node add-unapproved-staff-data.js",
-    "test": "node --test config/neonDatabase.test.js"
+    "test": "node --test config/neonDatabase.test.js controllers/socialController.test.js"
   },
   "keywords": [
     "brokerage",
