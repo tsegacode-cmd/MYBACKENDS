@@ -12,18 +12,27 @@ const matchesPaidAmount = (savedValue, expectedValue) => {
   if (expectedValue == null) return savedValue == null;
   return savedValue != null && Number(savedValue) === expectedValue;
 };
+let registrationColumnsPromise = null;
 const ensureRegistrationColumns = async () => {
-  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS national_id TEXT');
-  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS receipt_no TEXT');
-  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS round BIGINT NOT NULL DEFAULT 1');
-  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS project_title TEXT');
-  await queryNeon("ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'unpaid'");
-  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS paid_amount DOUBLE PRECISION');
-  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS house_no TEXT');
-  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS staff_id BIGINT');
-  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS staff_username TEXT');
-  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS staff_full_name TEXT');
-  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS staff_role TEXT');
+  if (!registrationColumnsPromise) {
+    registrationColumnsPromise = queryNeon(`
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS national_id TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS receipt_no TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS round BIGINT NOT NULL DEFAULT 1;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS project_title TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'unpaid';
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS paid_amount DOUBLE PRECISION;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS house_no TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS staff_id BIGINT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS staff_username TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS staff_full_name TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS staff_role TEXT;
+    `).catch(error => {
+      registrationColumnsPromise = null;
+      throw error;
+    });
+  }
+  await registrationColumnsPromise;
 };
 const ensureProjectTitleSchema = async () => {
   await queryNeon(`
