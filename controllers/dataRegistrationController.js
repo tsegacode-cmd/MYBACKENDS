@@ -1,16 +1,18 @@
 import { queryNeon, withNeonTransaction } from '../config/neonDatabase.js';
 
 const queryRows = async (sql, params = []) => (await queryNeon(sql, params)).rows;
+const normalizePaidAmount = value => Math.round((value + Number.EPSILON) * 100) / 100;
 const parsePaidAmount = value => {
   if (value == null || value === '') return { valid: true, amount: null };
   const amount = typeof value === 'number' ? value : Number(String(value).trim());
   return Number.isFinite(amount) && amount >= 0
-    ? { valid: true, amount }
+    ? { valid: true, amount: normalizePaidAmount(amount) }
     : { valid: false, amount: null };
 };
 const matchesPaidAmount = (savedValue, expectedValue) => {
   if (expectedValue == null) return savedValue == null;
-  return savedValue != null && Number(savedValue) === expectedValue;
+  return savedValue != null &&
+    normalizePaidAmount(Number(savedValue)) === normalizePaidAmount(expectedValue);
 };
 const normalizeReceiptNumber = value => {
   const receiptNumber = String(value ?? '').trim();
