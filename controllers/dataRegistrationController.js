@@ -1,6 +1,17 @@
 import { queryNeon, withNeonTransaction } from '../config/neonDatabase.js';
 
 const queryRows = async (sql, params = []) => (await queryNeon(sql, params)).rows;
+const parsePaidAmount = value => {
+  if (value == null || value === '') return { valid: true, amount: null };
+  const amount = typeof value === 'number' ? value : Number(String(value).trim());
+  return Number.isFinite(amount) && amount >= 0
+    ? { valid: true, amount }
+    : { valid: false, amount: null };
+};
+const matchesPaidAmount = (savedValue, expectedValue) => {
+  if (expectedValue == null) return savedValue == null;
+  return savedValue != null && Number(savedValue) === expectedValue;
+};
 const ensureRegistrationColumns = async () => {
   await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS national_id TEXT');
   await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS receipt_no TEXT');
@@ -8,6 +19,11 @@ const ensureRegistrationColumns = async () => {
   await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS project_title TEXT');
   await queryNeon("ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'unpaid'");
   await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS paid_amount DOUBLE PRECISION');
+  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS house_no TEXT');
+  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS staff_id BIGINT');
+  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS staff_username TEXT');
+  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS staff_full_name TEXT');
+  await queryNeon('ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS staff_role TEXT');
 };
 const ensureProjectTitleSchema = async () => {
   await queryNeon(`
@@ -297,6 +313,10 @@ export const createRegistration = async (req, res, next) => {
     )) {
       return res.status(400).json({ success: false, message: 'Transaction number must be text no longer than 2000 characters.' });
     }
+    const paidAmount = parsePaidAmount(req.body?.paid_amount);
+    if (!paidAmount.valid) {
+      return res.status(400).json({ success: false, message: 'Payment amount must be a valid non-negative number.' });
+    }
     
     const columnRows = await queryRows(`
       SELECT column_name, is_nullable, column_default
@@ -319,6 +339,8 @@ export const createRegistration = async (req, res, next) => {
         insertData[column] = typeof req.body.payment_status === 'string'
           ? req.body.payment_status.trim().toLowerCase() || 'unpaid'
           : 'unpaid';
+      } else if (column === 'paid_amount') {
+        insertData[column] = paidAmount.amount;
       } else if (req.body[column] !== undefined) {
         insertData[column] = req.body[column];
       } else {
@@ -339,7 +361,7 @@ export const createRegistration = async (req, res, next) => {
           case 'condition': insertData[column] = req.body.condition || 'new'; break;
           case 'sign': insertData[column] = req.body.sign || 'sign'; break;
           case 'gov_letter': insertData[column] = req.body.gov_letter || 'accept'; break;
-          case 'paid_amount': insertData[column] = req.body.paid_amount || null; break;
+          case 'paid_amount': insertData[column] = paidAmount.amount; break;
           case 'payment_status': insertData[column] = req.body.payment_status || 'unpaid'; break;
           case 'round': insertData[column] = registrationRound; break;
           case 'payment_period_type': insertData[column] = req.body.payment_period_type || '2014-2018'; break;
@@ -416,7 +438,7 @@ export const createRegistration = async (req, res, next) => {
       if (expectedPaymentStatus && String(saved?.payment_status || '').trim().toLowerCase() !== expectedPaymentStatus) {
         throw new Error(`Database saved payment status "${saved?.payment_status || ''}"; expected "${expectedPaymentStatus}"`);
       }
-      if (req.body.paid_amount != null && Number(saved?.paid_amount) !== Number(req.body.paid_amount)) {
+      if (!matchesPaidAmount(saved?.paid_amount, paidAmount.amount)) {
         throw new Error('Database did not save the requested payment amount.');
       }
       if (req.body.bank_receipt_pdf) {
@@ -472,6 +494,13 @@ export const updateRegistration = async (req, res, next) => {
     }
     if (typeof updates.national_id === 'string') updates.national_id = updates.national_id.trim() || null;
     if (typeof updates.receipt_no === 'string') updates.receipt_no = updates.receipt_no.trim() || null;
+    const paidAmount = Object.prototype.hasOwnProperty.call(updates, 'paid_amount')
+      ? parsePaidAmount(updates.paid_amount)
+      : null;
+    if (paidAmount && !paidAmount.valid) {
+      return res.status(400).json({ success: false, message: 'Payment amount must be a valid non-negative number.' });
+    }
+    if (paidAmount) updates.paid_amount = paidAmount.amount;
     await ensureRegistrationColumns();
     if (
       (Object.prototype.hasOwnProperty.call(updates, 'bank_receipt_pdf') && !isValidPdfDataUrl(updates.bank_receipt_pdf)) ||
@@ -599,7 +628,7 @@ export const updateRegistration = async (req, res, next) => {
         throw new Error(`Database saved payment status "${saved?.payment_status || ''}"; expected "${filteredUpdates.payment_status}"`);
       }
       if (Object.prototype.hasOwnProperty.call(filteredUpdates, 'paid_amount') &&
-          Number(saved?.paid_amount) !== Number(filteredUpdates.paid_amount)) {
+          !matchesPaidAmount(saved?.paid_amount, filteredUpdates.paid_amount)) {
         throw new Error('Database did not save the requested payment amount.');
       }
       return saved;
