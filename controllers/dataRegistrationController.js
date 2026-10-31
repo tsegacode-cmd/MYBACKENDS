@@ -25,8 +25,18 @@ const ensureRegistrationColumns = async () => {
     registrationColumnsPromise = queryNeon(`
       ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS national_id TEXT;
       ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS receipt_no TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS client_type TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS person TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS client_email TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS org_type TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS contact_person TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS address TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS city TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS kebele TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS client_phone TEXT;
       ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS round BIGINT NOT NULL DEFAULT 1;
       ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS project_title TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS payment_period_type TEXT;
       ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'unpaid';
       ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS paid_amount DOUBLE PRECISION;
       ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS house_no TEXT;
@@ -34,6 +44,19 @@ const ensureRegistrationColumns = async () => {
       ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS staff_username TEXT;
       ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS staff_full_name TEXT;
       ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS staff_role TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS registered_at TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS bank_receipt_pdf TEXT;
+      ALTER TABLE data_registrations ADD COLUMN IF NOT EXISTS owner_receipt_pdf TEXT;
+      CREATE TABLE IF NOT EXISTS bank_receipt_documents (
+        registration_id BIGINT PRIMARY KEY REFERENCES data_registrations(_id) ON DELETE CASCADE,
+        pdf_data TEXT NOT NULL,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP::text
+      );
+      CREATE TABLE IF NOT EXISTS owner_receipt_documents (
+        registration_id BIGINT PRIMARY KEY REFERENCES data_registrations(_id) ON DELETE CASCADE,
+        pdf_data TEXT NOT NULL,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP::text
+      );
     `).catch(error => {
       registrationColumnsPromise = null;
       throw error;
@@ -117,8 +140,11 @@ export const getProjectDocuments = async (req, res, next) => {
 
 export const getBankReceiptDocument = async (req, res, next) => {
   try {
+    await ensureRegistrationColumns();
     const [row] = await queryRows('SELECT pdf_data FROM bank_receipt_documents WHERE registration_id::text = $1::text', [req.params.id]);
-    return res.json({ success: true, data: row?.pdf_data || null });
+    if (row?.pdf_data) return res.json({ success: true, data: row.pdf_data });
+    const [registration] = await queryRows('SELECT bank_receipt_pdf FROM data_registrations WHERE _id::text = $1::text', [req.params.id]);
+    return res.json({ success: true, data: registration?.bank_receipt_pdf || null });
   } catch (error) {
     return next(error);
   }
@@ -126,8 +152,11 @@ export const getBankReceiptDocument = async (req, res, next) => {
 
 export const getOwnerReceiptDocument = async (req, res, next) => {
   try {
+    await ensureRegistrationColumns();
     const [row] = await queryRows('SELECT pdf_data FROM owner_receipt_documents WHERE registration_id::text = $1::text', [req.params.id]);
-    return res.json({ success: true, data: row?.pdf_data || null });
+    if (row?.pdf_data) return res.json({ success: true, data: row.pdf_data });
+    const [registration] = await queryRows('SELECT owner_receipt_pdf FROM data_registrations WHERE _id::text = $1::text', [req.params.id]);
+    return res.json({ success: true, data: registration?.owner_receipt_pdf || null });
   } catch (error) {
     return next(error);
   }
@@ -234,7 +263,15 @@ export const getAllRegistrations = async (req, res, next) => {
         EXISTS (
           SELECT 1 FROM registration_image_documents image
           WHERE image.registration_id::text = registration._id::text
-        ) AS has_registration_image
+        ) AS has_registration_image,
+        EXISTS (
+          SELECT 1 FROM bank_receipt_documents document
+          WHERE document.registration_id::text = registration._id::text
+        ) OR registration.bank_receipt_pdf IS NOT NULL AS has_bank_receipt,
+        EXISTS (
+          SELECT 1 FROM owner_receipt_documents document
+          WHERE document.registration_id::text = registration._id::text
+        ) OR registration.owner_receipt_pdf IS NOT NULL AS has_owner_receipt
       FROM data_registrations registration
       ORDER BY registration.created_at DESC
     `);
@@ -243,7 +280,9 @@ export const getAllRegistrations = async (req, res, next) => {
     const formattedRegistrations = registrations.map(reg => ({
       ...reg,
       id: reg._id,
-      has_registration_image: Boolean(reg.has_registration_image)
+      has_registration_image: Boolean(reg.has_registration_image),
+      has_bank_receipt: Boolean(reg.has_bank_receipt),
+      has_owner_receipt: Boolean(reg.has_owner_receipt)
     }));
 
     res.json({
@@ -259,6 +298,7 @@ export const getAllRegistrations = async (req, res, next) => {
 // Get single registration by ID
 export const getRegistrationById = async (req, res, next) => {
   try {
+    await ensureRegistrationColumns();
     const { id } = req.params;
     const [registration] = await queryRows('SELECT * FROM data_registrations WHERE _id = $1', [id]);
 
@@ -271,13 +311,17 @@ export const getRegistrationById = async (req, res, next) => {
 
     const [image] = await queryRows('SELECT 1 FROM registration_image_documents WHERE registration_id::text = $1::text', [id]);
     const [bankReceipt] = await queryRows('SELECT pdf_data FROM bank_receipt_documents WHERE registration_id::text = $1::text', [id]);
+    const [ownerReceipt] = await queryRows('SELECT pdf_data FROM owner_receipt_documents WHERE registration_id::text = $1::text', [id]);
     res.json({
       success: true,
       data: {
         ...registration,
         id: registration._id,
         has_registration_image: Boolean(image),
-        bank_receipt_pdf: bankReceipt?.pdf_data || null
+        has_bank_receipt: Boolean(bankReceipt?.pdf_data || registration.bank_receipt_pdf),
+        has_owner_receipt: Boolean(ownerReceipt?.pdf_data || registration.owner_receipt_pdf),
+        bank_receipt_pdf: bankReceipt?.pdf_data || registration.bank_receipt_pdf || null,
+        owner_receipt_pdf: ownerReceipt?.pdf_data || registration.owner_receipt_pdf || null
       }
     });
   } catch (error) {
@@ -341,7 +385,7 @@ export const createRegistration = async (req, res, next) => {
     `);
     if (!columnRows.length) throw new Error('Neon data_registrations table is missing or has no columns.');
 
-    const autoFields = ['_id', 'created_at', 'updated_at'];
+    const autoFields = ['_id', 'created_at', 'updated_at', 'bank_receipt_pdf', 'owner_receipt_pdf'];
     const insertData = {};
     for (const metadata of columnRows) {
       const { column_name: column, is_nullable: isNullable, column_default: columnDefault } = metadata;
