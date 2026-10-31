@@ -12,6 +12,11 @@ const matchesPaidAmount = (savedValue, expectedValue) => {
   if (expectedValue == null) return savedValue == null;
   return savedValue != null && Number(savedValue) === expectedValue;
 };
+const normalizeReceiptNumber = value => {
+  const receiptNumber = String(value ?? '').trim();
+  if (/^\d+$/.test(receiptNumber)) return `number:${BigInt(receiptNumber).toString()}`;
+  return receiptNumber ? `text:${receiptNumber.toLocaleLowerCase()}` : '';
+};
 let registrationColumnsPromise = null;
 const ensureRegistrationColumns = async () => {
   if (!registrationColumnsPromise) {
@@ -417,13 +422,18 @@ export const createRegistration = async (req, res, next) => {
     const savedRegistration = await withNeonTransaction(async client => {
       const receiptNumber = String(insertData.receipt_no || '').trim();
       if (receiptNumber) {
-        const duplicateKey = `data-registration:${registrationRound}:${receiptNumber.toLocaleLowerCase()}`;
+        const duplicateKey = `data-registration:${registrationRound}:${normalizeReceiptNumber(receiptNumber)}`;
         await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [duplicateKey]);
         const duplicate = await client.query(`
           SELECT _id FROM data_registrations
-          WHERE round = $1 AND LOWER(BTRIM(receipt_no)) = LOWER(BTRIM($2))
+          WHERE round = $1
+            AND CASE
+              WHEN BTRIM(receipt_no) ~ '^[0-9]+$'
+                THEN 'number:' || COALESCE(NULLIF(LTRIM(BTRIM(receipt_no), '0'), ''), '0')
+              ELSE 'text:' || LOWER(BTRIM(receipt_no))
+            END = $2
           LIMIT 1
-        `, [registrationRound, receiptNumber]);
+        `, [registrationRound, normalizeReceiptNumber(receiptNumber)]);
         if (duplicate.rowCount) {
           const error = new Error(`Receipt number "${receiptNumber}" is already registered in Round ${registrationRound}.`);
           error.statusCode = 409;
@@ -594,13 +604,17 @@ export const updateRegistration = async (req, res, next) => {
         Object.prototype.hasOwnProperty.call(filteredUpdates, 'receipt_no') ||
         Object.prototype.hasOwnProperty.call(filteredUpdates, 'round');
       if (registrationIdentityChanged && receiptNumber) {
-        const duplicateKey = `data-registration:${registrationRound}:${receiptNumber.toLocaleLowerCase()}`;
+        const duplicateKey = `data-registration:${registrationRound}:${normalizeReceiptNumber(receiptNumber)}`;
         await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [duplicateKey]);
         const duplicate = await client.query(`
           SELECT _id FROM data_registrations
-          WHERE round = $1 AND LOWER(BTRIM(receipt_no)) = LOWER(BTRIM($2)) AND _id <> $3
+          WHERE round = $1 AND CASE
+            WHEN BTRIM(receipt_no) ~ '^[0-9]+$'
+              THEN 'number:' || COALESCE(NULLIF(LTRIM(BTRIM(receipt_no), '0'), ''), '0')
+            ELSE 'text:' || LOWER(BTRIM(receipt_no))
+          END = $2 AND _id <> $3
           LIMIT 1
-        `, [registrationRound, receiptNumber, id]);
+        `, [registrationRound, normalizeReceiptNumber(receiptNumber), id]);
         if (duplicate.rowCount) {
           const error = new Error(`Receipt number "${receiptNumber}" is already registered in Round ${registrationRound}.`);
           error.statusCode = 409;
